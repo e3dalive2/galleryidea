@@ -135,7 +135,22 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
 	}
-	w.Header().Set("Content-Disposition", "attachment; filename="+filepath.Base(fullPath))
+
+	// Force download only when explicitly requested via ?download=1.
+	// Otherwise serve inline so browsers can render images, PDFs, text, etc.
+	disposition := "inline"
+	if r.URL.Query().Get("download") == "1" {
+		disposition = "attachment"
+	}
+	w.Header().Set("Content-Disposition",
+		fmt.Sprintf(`%s; filename=%q`, disposition, filepath.Base(fullPath)))
+
+	// Set an explicit Content-Type for images so browsers don't sniff it as
+	// application/octet-stream (which also triggers a download in some setups).
+	if ct := contentTypeFor(fullPath); ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+
 	http.ServeFile(w, r, fullPath)
 }
 
@@ -191,6 +206,22 @@ func isDir(path string) bool {
 func isImageFile(name string) bool {
 	ext := strings.ToLower(filepath.Ext(name))
 	return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".gif"
+}
+
+func contentTypeFor(name string) string {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".svg":
+		return "image/svg+xml"
+	}
+	return ""
 }
 
 func humanSize(bytes int64) string {

@@ -113,6 +113,7 @@
             border-radius: 8px;
             background: #e2e8f0;
             margin-bottom: 8px;
+            cursor: pointer;
         }
         .gallery-view .item-name {
             font-size: 0.85rem;
@@ -160,7 +161,7 @@
     <div class="file-list list-view" id="fileList">
         <div class="empty">⏳ Loading...</div>
     </div>
-    <footer>Click on image thumbnails to download full file</footer>
+    <footer>Click images to view in browser · use ⬇️ / "download" to save</footer>
 </div>
 
 <script>
@@ -220,13 +221,18 @@
                     html += `<div class="item"><div class="item-icon">📁</div><div class="item-name"><a href="#" class="folder-link" data-path="${escapeAttr(item.path)}">${escapeHtml(item.name)}</a></div></div>`;
                 }
             } else {
-                const downloadUrl = `/api/download?file=${encodeURIComponent(item.path)}`;
+                const viewUrl = `/api/download?file=${encodeURIComponent(item.path)}`;
+                const downloadUrl = `${viewUrl}&download=1`;
                 if (currentView === 'list') {
-                    html += `<div class="item"><div class="item-icon">${item.isImage ? '🖼️' : '📄'}</div><div class="item-name"><a href="${downloadUrl}" download>${escapeHtml(item.name)}</a> ${item.size ? `<small>(${item.size})</small>` : ''}</div><div class="item-size"></div></div>`;
+                    if (item.isImage) {
+                        html += `<div class="item"><div class="item-icon">🖼️</div><div class="item-name"><a href="${viewUrl}" target="_blank" rel="noopener">${escapeHtml(item.name)}</a> ${item.size ? `<small>(${item.size})</small>` : ''} <a href="${downloadUrl}" download title="Download">⬇️</a></div><div class="item-size"></div></div>`;
+                    } else {
+                        html += `<div class="item"><div class="item-icon">📄</div><div class="item-name"><a href="${downloadUrl}" download>${escapeHtml(item.name)}</a> ${item.size ? `<small>(${item.size})</small>` : ''}</div><div class="item-size"></div></div>`;
+                    }
                 } else {
                     if (item.isImage) {
                         const thumbUrl = `/api/thumbnail?file=${encodeURIComponent(item.path)}`;
-                        html += `<div class="item"><img class="thumbnail" src="${thumbUrl}" loading="lazy" alt="${escapeHtml(item.name)}"><div class="item-name"><a href="${downloadUrl}" download>${escapeHtml(item.name)}</a></div><div class="item-size">${item.size || ''}</div></div>`;
+                        html += `<div class="item"><a href="${viewUrl}" target="_blank" rel="noopener"><img class="thumbnail" src="${thumbUrl}" loading="lazy" alt="${escapeHtml(item.name)}"></a><div class="item-name"><a href="${viewUrl}" target="_blank" rel="noopener">${escapeHtml(item.name)}</a></div><div class="item-size">${item.size || ''} · <a href="${downloadUrl}" download>download</a></div></div>`;
                     } else {
                         html += `<div class="item"><div class="item-icon">📄</div><div class="item-name"><a href="${downloadUrl}" download>${escapeHtml(item.name)}</a></div><div class="item-size">${item.size || ''}</div></div>`;
                     }
