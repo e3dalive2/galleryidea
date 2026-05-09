@@ -5,10 +5,14 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/image/draw"
 )
 
 //go:embed index.html
@@ -17,25 +21,25 @@ var frontend embed.FS
 var baseDir string
 
 type FileInfo struct {
-	Name string `json:"name"`
-	Type string `json:"type"` // "dir" or "file"
-	Path string `json:"path"`
-	Size string `json:"size,omitempty"`
+	Name    string `json:"name"`
+	Type    string `json:"type"`
+	Path    string `json:"path"`
+	Size    string `json:"size,omitempty"`
+	IsImage bool   `json:"isImage,omitempty"`
 }
 
 type ListResponse struct {
-	CurrentDir       string     `json:"currentDir"`
-	BasePathForDisplay string   `json:"basePathForDisplay"`
-	Contents         []FileInfo `json:"contents"`
-	Error            string     `json:"error,omitempty"`
+	CurrentDir         string     `json:"currentDir"`
+	BasePathForDisplay string     `json:"basePathForDisplay"`
+	Contents           []FileInfo `json:"contents"`
+	Error              string     `json:"error,omitempty"`
 }
 
 func main() {
-	dirFlag := flag.String("dir", ".", "Root directory to browse (absolute or relative)")
+	dirFlag := flag.String("dir", ".", "Root directory to browse")
 	portFlag := flag.String("port", "8080", "Port to listen on")
 	flag.Parse()
 
-	// Resolve absolute path of the root directory
 	abs, err := filepath.Abs(*dirFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Invalid directory: %v\n", err)
@@ -44,21 +48,19 @@ func main() {
 	baseDir = abs
 	info, err := os.Stat(baseDir)
 	if err != nil || !info.IsDir() {
-		fmt.Fprintf(os.Stderr, "Directory does not exist or is not a folder: %s\n", baseDir)
+		fmt.Fprintf(os.Stderr, "Directory does not exist: %s\n", baseDir)
 		os.Exit(1)
 	}
 
 	http.HandleFunc("/", serveFrontend)
 	http.HandleFunc("/api/list", handleList)
 	http.HandleFunc("/api/download", handleDownload)
+	http.HandleFunc("/api/thumbnail", handleThumbnail)
 
 	addr := ":" + *portFlag
-	fmt.Printf("🌐 Serving directory: %s\n", baseDir)
-	fmt.Printf("🚀 Starting server at http://localhost%s\n", addr)
-	fmt.Println("Press Ctrl+C to stop")
-	if err := http.ListenAndServe(addr, nil); err != nil {
-		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
-	}
+	fmt.Printf("🌐 Serving: %s\n", baseDir)
+	fmt.Printf("🚀 Gallery at http://localhost%s\n", addr)
+	http.ListenAndServe(addr, nil)
 }
 
 func serveFrontend(w http.ResponseWriter, r *http.Request) {
@@ -78,15 +80,8 @@ func serveFrontend(w http.ResponseWriter, r *http.Request) {
 func handleList(w http.ResponseWriter, r *http.Request) {
 	relPath := r.URL.Query().Get("dir")
 	fullPath := safeJoin(baseDir, relPath)
-
-	if fullPath == "" {
-		sendJSONError(w, "Invalid path", http.StatusForbidden)
-		return
-	}
-
-	info, err := os.Stat(fullPath)
-	if err != nil || !info.IsDir() {
-		sendJSONError(w, "Directory not found", http.StatusNotFound)
+	if fullPath == "" || !isDir(fullPath) {
+		sendJSONError(w, "Invalid directory", http.StatusNotFound)
 		return
 	}
 
@@ -104,34 +99,30 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 		rel = filepath.ToSlash(rel)
 
 		if entry.IsDir() {
-			contents = append(contents, FileInfo{
-				Name: name,
-				Type: "dir",
-				Path: rel,
-			})
+			contents = append(contents, FileInfo{Name: name, Type: "dir", Path: rel})
 		} else {
-			info, err := entry.Info()
+			info, _ := entry.Info()
 			sizeBytes := int64(0)
-			if err == nil {
+			if info != nil {
 				sizeBytes = info.Size()
 			}
 			sizeHuman := humanSize(sizeBytes)
+			isImg := isImageFile(name)
 			contents = append(contents, FileInfo{
-				Name: name,
-				Type: "file",
-				Path: rel,
-				Size: sizeHuman,
+				Name:    name,
+				Type:    "file",
+				Path:    rel,
+				Size:    sizeHuman,
+				IsImage: isImg,
 			})
 		}
 	}
 
-	// Sort: directories first, then by name
 	sortContents(contents)
-
 	resp := ListResponse{
-		CurrentDir:       filepath.ToSlash(relPath),
+		CurrentDir:         filepath.ToSlash(relPath),
 		BasePathForDisplay: filepath.Base(baseDir),
-		Contents:         contents,
+		Contents:           contents,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
@@ -140,30 +131,51 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 func handleDownload(w http.ResponseWriter, r *http.Request) {
 	fileRel := r.URL.Query().Get("file")
 	fullPath := safeJoin(baseDir, fileRel)
-
-	if fullPath == "" {
-		http.Error(w, "Forbidden", http.StatusForbidden)
-		return
-	}
-
-	info, err := os.Stat(fullPath)
-	if err != nil || info.IsDir() {
+	if fullPath == "" || isDir(fullPath) {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
 	}
-
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filepath.Base(fullPath)))
+	w.Header().Set("Content-Disposition", "attachment; filename="+filepath.Base(fullPath))
 	http.ServeFile(w, r, fullPath)
 }
 
-// safeJoin prevents directory traversal attacks
+func handleThumbnail(w http.ResponseWriter, r *http.Request) {
+	fileRel := r.URL.Query().Get("file")
+	fullPath := safeJoin(baseDir, fileRel)
+	if fullPath == "" || isDir(fullPath) || !isImageFile(fullPath) {
+		http.Error(w, "Not an image", http.StatusNotFound)
+		return
+	}
+
+	file, err := os.Open(fullPath)
+	if err != nil {
+		http.Error(w, "Cannot open image", http.StatusInternalServerError)
+		return
+	}
+	defer file.Close()
+
+	img, _, err := image.Decode(file)
+	if err != nil {
+		http.Error(w, "Unsupported image format", http.StatusBadRequest)
+		return
+	}
+
+	srcBounds := img.Bounds()
+	width := 300
+	height := int(float64(srcBounds.Dy()) * (float64(width) / float64(srcBounds.Dx())))
+	dst := image.NewRGBA(image.Rect(0, 0, width, height))
+	draw.ApproxBiLinear.Scale(dst, dst.Bounds(), img, srcBounds, draw.Over, nil)
+
+	w.Header().Set("Content-Type", "image/jpeg")
+	jpeg.Encode(w, dst, &jpeg.Options{Quality: 85})
+}
+
+// Helper functions (same as before)
 func safeJoin(base, rel string) string {
 	if rel == "" {
 		return base
 	}
-	// Clean the relative path and join
 	cleanRel := filepath.Clean(rel)
-	// Ensure it doesn't try to escape using ".."
 	full := filepath.Join(base, cleanRel)
 	if !strings.HasPrefix(full, base+string(os.PathSeparator)) && full != base {
 		return ""
@@ -171,10 +183,14 @@ func safeJoin(base, rel string) string {
 	return full
 }
 
-func sendJSONError(w http.ResponseWriter, msg string, status int) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(ListResponse{Error: msg})
+func isDir(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+func isImageFile(name string) bool {
+	ext := strings.ToLower(filepath.Ext(name))
+	return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".gif"
 }
 
 func humanSize(bytes int64) string {
@@ -193,17 +209,21 @@ func humanSize(bytes int64) string {
 func sortContents(items []FileInfo) {
 	for i := 0; i < len(items)-1; i++ {
 		for j := i + 1; j < len(items); j++ {
-			// Directories before files
 			if items[i].Type != items[j].Type {
 				if items[i].Type == "file" && items[j].Type == "dir" {
 					items[i], items[j] = items[j], items[i]
 				}
 				continue
 			}
-			// Same type: alphabetical
 			if strings.ToLower(items[i].Name) > strings.ToLower(items[j].Name) {
 				items[i], items[j] = items[j], items[i]
 			}
 		}
 	}
+}
+
+func sendJSONError(w http.ResponseWriter, msg string, status int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(ListResponse{Error: msg})
 }
