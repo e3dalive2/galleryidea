@@ -34,7 +34,17 @@ var frontend embed.FS
 
 var baseDir string
 var db *sql.DB
-var heicCacheDir string // directory for cached HEIC→JPEG previews; empty = no cache
+var (
+	thumbCacheDir   string // 300px JPEG thumbnails
+	previewCacheDir string // 1080p JPEG previews
+)
+
+const (
+	thumbWidth   = 300
+	previewWidth = 1920 // longest-edge target for 1080p-class screens
+	thumbQuality = 80
+	previewJPEGQ = 85
+)
 
 // Pre-hashed expected credentials. Hashing both the expected and the supplied
 // values lets us compare with constant-time equality on equal-length inputs,
@@ -93,6 +103,7 @@ func main() {
 	userFlag := flag.String("user", "", "Username for HTTP basic auth (also reads $GALLERY_USER). Leave empty to disable auth.")
 	passFlag := flag.String("pass", "", "Password for HTTP basic auth (also reads $GALLERY_PASS).")
 	dbFlag := flag.String("db", "comments.db", "Path to SQLite database file for comments")
+	cacheFlag := flag.String("cache-dir", "", "Directory for image caches (thumbnails + 1080p previews). Default: <dir of -db>/cache")
 	flag.Parse()
 
 	if *decodeHeicFlag != "" {
@@ -139,13 +150,20 @@ func main() {
 	}
 	defer db.Close()
 
-	// Stash HEIC preview JPEGs alongside the comments DB. Decoding HEIC is
-	// expensive (hundreds of ms per image); caching makes subsequent views
-	// instant.
-	heicCacheDir = filepath.Join(filepath.Dir(*dbFlag), "heic-cache")
-	if err := os.MkdirAll(heicCacheDir, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "Cannot create cache dir: %v\n", err)
-		heicCacheDir = "" // disable caching, keep going
+	// Image caches: thumbnails (300px) and previews (1920px). Both speed up
+	// repeat views and let slow disks/HEIC decoding pay off only once per file.
+	cacheRoot := *cacheFlag
+	if cacheRoot == "" {
+		cacheRoot = filepath.Join(filepath.Dir(*dbFlag), "cache")
+	}
+	thumbCacheDir = filepath.Join(cacheRoot, "thumbs")
+	previewCacheDir = filepath.Join(cacheRoot, "previews")
+	for _, d := range []string{thumbCacheDir, previewCacheDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "Cannot create cache dir %s: %v\n", d, err)
+			thumbCacheDir, previewCacheDir = "", "" // disable caching, keep going
+			break
+		}
 	}
 
 	mux := http.NewServeMux()
@@ -159,6 +177,11 @@ func main() {
 	addr := ":" + *portFlag
 	fmt.Printf("🌐 Serving: %s\n", baseDir)
 	fmt.Printf("💬 Comments DB: %s\n", *dbFlag)
+	if thumbCacheDir != "" {
+		fmt.Printf("🗂️  Image cache: %s\n", cacheRoot)
+	} else {
+		fmt.Println("⚠️  Image cache disabled (cache dir creation failed)")
+	}
 	if authEnabled {
 		fmt.Printf("🔒 Auth enabled for user %q\n", user)
 	} else {
@@ -404,51 +427,137 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleThumbnail(w http.ResponseWriter, r *http.Request) {
+	serveResizedImage(w, r, thumbCacheDir, thumbWidth, thumbQuality)
+}
+
+// handlePreview serves a 1080p-class JPEG. Originals (often 12+ MB iPhone
+// photos) are too big to push down a slow link for every preview, so we
+// resize and cache them too. The download button uses /api/download for the
+// original.
+func handlePreview(w http.ResponseWriter, r *http.Request) {
+	serveResizedImage(w, r, previewCacheDir, previewWidth, previewJPEGQ)
+}
+
+// serveResizedImage is the shared cache-aware resizer. It:
+//   1. Validates the path and confirms it's an image.
+//   2. Hashes (path + mtime + size) for the cache key.
+//   3. Streams the cached JPEG straight from disk on hit.
+//   4. On miss: decodes (subprocess for HEIC), resizes if needed, encodes
+//      as JPEG, atomically writes the cache file, then serves it.
+//
+// The same function powers thumbnails (300px) and previews (1920px) — the
+// only difference is the target width, JPEG quality, and cache directory.
+func serveResizedImage(w http.ResponseWriter, r *http.Request, cacheDir string, targetWidth, quality int) {
 	fileRel := r.URL.Query().Get("file")
 	fullPath := safeJoin(baseDir, fileRel)
 	if fullPath == "" || isDir(fullPath) || !isImageFile(fullPath) {
 		http.Error(w, "Not an image", http.StatusNotFound)
 		return
 	}
+	stat, err := os.Stat(fullPath)
+	if err != nil {
+		http.Error(w, "Cannot stat image", http.StatusInternalServerError)
+		return
+	}
 
-	var img image.Image
-	if isHeicFile(fullPath) {
-		// Decode out-of-process to JPEG bytes, then decode the JPEG so we can
-		// resize. Crashes in the HEIC subprocess don't affect this server.
-		jpegBytes, err := decodeHeicToJPEG(fullPath)
-		if err != nil {
-			http.Error(w, "Unsupported image: "+err.Error(), http.StatusBadRequest)
+	// 1. Cache hit?
+	cachePath := cachedPathFor(cacheDir, fullPath, stat, targetWidth)
+	if cachePath != "" {
+		if f, err := os.Open(cachePath); err == nil {
+			defer f.Close()
+			w.Header().Set("Content-Type", "image/jpeg")
+			w.Header().Set("Cache-Control", "private, max-age=3600")
+			io.Copy(w, f)
 			return
 		}
-		decoded, err := decodeImage(bytes.NewReader(jpegBytes))
+	}
+
+	// 2. Decode (HEIC out-of-process; everything else in-process).
+	var src image.Image
+	if isHeicFile(fullPath) {
+		jpegBytes, err := decodeHeicToJPEG(fullPath)
+		if err != nil {
+			http.Error(w, "Unsupported image: "+err.Error(), http.StatusUnsupportedMediaType)
+			return
+		}
+		src, err = decodeImage(bytes.NewReader(jpegBytes))
 		if err != nil {
 			http.Error(w, "Bad HEIC subprocess output: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		img = decoded
 	} else {
-		file, err := os.Open(fullPath)
+		f, err := os.Open(fullPath)
 		if err != nil {
 			http.Error(w, "Cannot open image", http.StatusInternalServerError)
 			return
 		}
-		defer file.Close()
-		decoded, err := decodeImage(file)
+		defer f.Close()
+		src, err = decodeImage(f)
 		if err != nil {
 			http.Error(w, "Unsupported image format: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		img = decoded
 	}
 
-	srcBounds := img.Bounds()
-	width := 300
-	height := int(float64(srcBounds.Dy()) * (float64(width) / float64(srcBounds.Dx())))
-	dst := image.NewRGBA(image.Rect(0, 0, width, height))
-	draw.ApproxBiLinear.Scale(dst, dst.Bounds(), img, srcBounds, draw.Over, nil)
+	// 3. Resize if larger than target. Skip resizing for already-small images
+	// to avoid quality loss from upscaling.
+	dst := resizeMaxWidth(src, targetWidth)
 
+	// 4. Encode JPEG once, write to both response and cache file. MultiWriter
+	// is cheaper than encoding twice.
 	w.Header().Set("Content-Type", "image/jpeg")
-	jpeg.Encode(w, dst, &jpeg.Options{Quality: 85})
+	w.Header().Set("Cache-Control", "private, max-age=3600")
+
+	if cachePath != "" {
+		if tmp, err := os.CreateTemp(cacheDir, ".tmp-*"); err == nil {
+			mw := io.MultiWriter(w, tmp)
+			if encErr := jpeg.Encode(mw, dst, &jpeg.Options{Quality: quality}); encErr != nil {
+				fmt.Fprintf(os.Stderr, "encode failed for %s: %v\n", fullPath, encErr)
+				tmp.Close()
+				os.Remove(tmp.Name())
+				return
+			}
+			tmp.Close()
+			if err := os.Rename(tmp.Name(), cachePath); err != nil {
+				os.Remove(tmp.Name())
+			}
+			return
+		}
+	}
+	if err := jpeg.Encode(w, dst, &jpeg.Options{Quality: quality}); err != nil {
+		fmt.Fprintf(os.Stderr, "encode failed for %s: %v\n", fullPath, err)
+	}
+}
+
+// resizeMaxWidth returns src resized so its longest edge is at most max.
+// Already-small images are returned unchanged. Aspect ratio preserved.
+func resizeMaxWidth(src image.Image, max int) image.Image {
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	long := w
+	if h > w {
+		long = h
+	}
+	if long <= max {
+		return src
+	}
+	scale := float64(max) / float64(long)
+	nw, nh := int(float64(w)*scale), int(float64(h)*scale)
+	dst := image.NewRGBA(image.Rect(0, 0, nw, nh))
+	draw.ApproxBiLinear.Scale(dst, dst.Bounds(), src, b, draw.Over, nil)
+	return dst
+}
+
+// cachedPathFor returns the disk cache path for a (file, target-width) pair.
+// Empty string means caching is disabled. The width is part of the key so
+// thumbnail and preview caches never collide even though they share the
+// directory tree's parent.
+func cachedPathFor(cacheDir, fullPath string, info os.FileInfo, width int) string {
+	if cacheDir == "" {
+		return ""
+	}
+	h := sha256.Sum256([]byte(fmt.Sprintf("%s|%d|%d|%d", fullPath, info.ModTime().UnixNano(), info.Size(), width)))
+	return filepath.Join(cacheDir, fmt.Sprintf("%x.jpg", h[:16]))
 }
 
 // heicSem caps concurrent HEIC decodes. The WASM runtime is memory-hungry —
@@ -511,8 +620,6 @@ func decodeHeicSubprocess(path string) {
 	}
 	defer f.Close()
 
-	// Recover from Go panics here too — they may produce useful messages.
-	// SIGSEGVs from inside WASM still kill us, which is the whole point.
 	defer func() {
 		if rec := recover(); rec != nil {
 			fmt.Fprintf(os.Stderr, "decoder panic: %v\n", rec)
@@ -533,99 +640,17 @@ func decodeHeicSubprocess(path string) {
 }
 
 // Recovered HTTP middleware: any panic inside the handler chain becomes a
-// 500 instead of crashing the process. Belt-and-braces: decodeImage already
-// recovers, but third-party code anywhere in the stack might panic too.
+// 500 instead of crashing the process.
 func withRecover(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if rec := recover(); rec != nil {
 				fmt.Fprintf(os.Stderr, "panic in %s %s: %v\n", r.Method, r.URL.Path, rec)
-				// Best-effort: only write the header if nothing's been sent yet.
-				// http.ResponseWriter doesn't expose "wrote yet?" so we just try
-				// and swallow any further error.
 				http.Error(w, "Internal server error", http.StatusInternalServerError)
 			}
 		}()
 		next.ServeHTTP(w, r)
 	})
-}
-
-// handlePreview returns an image suitable for inline browser display. For
-// formats browsers handle natively (JPEG/PNG/GIF) it just streams the file.
-// For HEIC/HEIF it decodes server-side and re-encodes as JPEG so the browser
-// can render it without any plugin.
-func handlePreview(w http.ResponseWriter, r *http.Request) {
-	fileRel := r.URL.Query().Get("file")
-	fullPath := safeJoin(baseDir, fileRel)
-	if fullPath == "" || isDir(fullPath) || !isImageFile(fullPath) {
-		http.Error(w, "Not an image", http.StatusNotFound)
-		return
-	}
-
-	// Native formats: stream the file, let the browser do the work.
-	if !isHeicFile(fullPath) {
-		if ct := contentTypeFor(fullPath); ct != "" {
-			w.Header().Set("Content-Type", ct)
-		}
-		http.ServeFile(w, r, fullPath)
-		return
-	}
-
-	// HEIC: decode out-of-process to JPEG, cache on disk, serve. Running the
-	// decoder in a subprocess means a SIGSEGV in the WASM HEIC decoder kills
-	// only the child — this server stays up.
-	stat, err := os.Stat(fullPath)
-	if err != nil {
-		http.Error(w, "Cannot stat image", http.StatusInternalServerError)
-		return
-	}
-	cachePath := heicCachePathFor(fullPath, stat)
-	if cachePath != "" {
-		if cached, err := os.Open(cachePath); err == nil {
-			defer cached.Close()
-			w.Header().Set("Content-Type", "image/jpeg")
-			w.Header().Set("Cache-Control", "private, max-age=3600")
-			io.Copy(w, cached)
-			return
-		}
-	}
-
-	jpegBytes, err := decodeHeicToJPEG(fullPath)
-	if err != nil {
-		http.Error(w, "Unsupported image: "+err.Error(), http.StatusUnsupportedMediaType)
-		return
-	}
-
-	// Persist to cache atomically (write temp + rename) so concurrent readers
-	// never see a partial file.
-	if cachePath != "" {
-		if tmp, err := os.CreateTemp(heicCacheDir, ".tmp-*"); err == nil {
-			if _, werr := tmp.Write(jpegBytes); werr != nil {
-				tmp.Close()
-				os.Remove(tmp.Name())
-			} else {
-				tmp.Close()
-				if err := os.Rename(tmp.Name(), cachePath); err != nil {
-					os.Remove(tmp.Name())
-				}
-			}
-		}
-	}
-
-	w.Header().Set("Content-Type", "image/jpeg")
-	w.Header().Set("Cache-Control", "private, max-age=3600")
-	w.Write(jpegBytes)
-}
-
-// heicCachePathFor returns the cache path for a HEIC file. The key includes
-// the file's mtime+size so edits invalidate the cache automatically. Returns
-// "" when caching is disabled.
-func heicCachePathFor(fullPath string, info os.FileInfo) string {
-	if heicCacheDir == "" {
-		return ""
-	}
-	h := sha256.Sum256([]byte(fmt.Sprintf("%s|%d|%d", fullPath, info.ModTime().UnixNano(), info.Size())))
-	return filepath.Join(heicCacheDir, fmt.Sprintf("%x.jpg", h[:16]))
 }
 
 // handleComments routes by HTTP method:
