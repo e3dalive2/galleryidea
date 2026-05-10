@@ -21,11 +21,14 @@ var frontend embed.FS
 var baseDir string
 
 type FileInfo struct {
-	Name    string `json:"name"`
-	Type    string `json:"type"`
-	Path    string `json:"path"`
-	Size    string `json:"size,omitempty"`
-	IsImage bool   `json:"isImage,omitempty"`
+	Name        string `json:"name"`
+	Type        string `json:"type"`
+	Path        string `json:"path"`
+	Size        string `json:"size,omitempty"`
+	SizeBytes   int64  `json:"sizeBytes,omitempty"`
+	IsImage     bool   `json:"isImage,omitempty"`
+	ModTime     string `json:"modTime,omitempty"`     // human-readable, for display
+	ModTimeUnix int64  `json:"modTimeUnix,omitempty"` // for sorting
 }
 
 type ListResponse struct {
@@ -98,22 +101,37 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 		rel, _ := filepath.Rel(baseDir, subPath)
 		rel = filepath.ToSlash(rel)
 
+		info, _ := entry.Info()
+		var modUnix int64
+		var modHuman string
+		if info != nil {
+			t := info.ModTime()
+			modUnix = t.Unix()
+			modHuman = t.Format("2006-01-02 15:04")
+		}
+
 		if entry.IsDir() {
-			contents = append(contents, FileInfo{Name: name, Type: "dir", Path: rel})
+			contents = append(contents, FileInfo{
+				Name:        name,
+				Type:        "dir",
+				Path:        rel,
+				ModTime:     modHuman,
+				ModTimeUnix: modUnix,
+			})
 		} else {
-			info, _ := entry.Info()
 			sizeBytes := int64(0)
 			if info != nil {
 				sizeBytes = info.Size()
 			}
-			sizeHuman := humanSize(sizeBytes)
-			isImg := isImageFile(name)
 			contents = append(contents, FileInfo{
-				Name:    name,
-				Type:    "file",
-				Path:    rel,
-				Size:    sizeHuman,
-				IsImage: isImg,
+				Name:        name,
+				Type:        "file",
+				Path:        rel,
+				Size:        humanSize(sizeBytes),
+				SizeBytes:   sizeBytes,
+				IsImage:     isImageFile(name),
+				ModTime:     modHuman,
+				ModTimeUnix: modUnix,
 			})
 		}
 	}

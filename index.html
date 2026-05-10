@@ -60,6 +60,37 @@
             color: #2563eb;
             text-decoration: none;
         }
+        .toolbar {
+            background: #f8fafc;
+            padding: 10px 24px;
+            border-bottom: 1px solid #e2e8f0;
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .toolbar-label {
+            font-size: 0.85rem;
+            color: #475569;
+            margin-right: 4px;
+        }
+        .sort-btn {
+            background: white;
+            border: 1px solid #cbd5e1;
+            color: #334155;
+            padding: 6px 12px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            font-weight: 500;
+            transition: 0.15s;
+        }
+        .sort-btn:hover { background: #f1f5f9; }
+        .sort-btn.active {
+            background: #3b82f6;
+            border-color: #3b82f6;
+            color: white;
+        }
         .file-list {
             padding: 20px;
         }
@@ -98,13 +129,21 @@
         .gallery-view .item {
             background: #f8fafc;
             border-radius: 12px;
-            padding: 12px;
+            padding: 0;
             text-align: center;
             transition: transform 0.1s, box-shadow 0.1s;
+            overflow: hidden;
         }
         .gallery-view .item:hover {
             transform: translateY(-2px);
             box-shadow: 0 8px 20px rgba(0,0,0,0.1);
+        }
+        .gallery-view .tile-link {
+            display: block;
+            padding: 12px;
+            text-decoration: none;
+            color: inherit;
+            cursor: pointer;
         }
         .gallery-view .thumbnail {
             width: 100%;
@@ -113,20 +152,45 @@
             border-radius: 8px;
             background: #e2e8f0;
             margin-bottom: 8px;
-            cursor: pointer;
+            display: block;
+        }
+        .gallery-view .folder-icon {
+            width: 100%;
+            aspect-ratio: 1 / 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 4rem;
+            background: #e2e8f0;
+            border-radius: 8px;
+            margin-bottom: 8px;
         }
         .gallery-view .item-name {
             font-size: 0.85rem;
             word-break: break-word;
-        }
-        .gallery-view .item-name a {
-            text-decoration: none;
             color: #1e293b;
+            font-weight: 500;
         }
-        .gallery-view .item-size {
+        .gallery-view .item-meta {
             font-size: 0.7rem;
             color: #64748b;
             margin-top: 4px;
+            display: flex;
+            justify-content: space-between;
+            gap: 6px;
+        }
+        .gallery-view .item-meta .download-link {
+            color: #2563eb;
+            text-decoration: none;
+        }
+        .gallery-view .item-meta .download-link:hover { text-decoration: underline; }
+        /* List view: also show date column */
+        .list-view .item-date {
+            color: #64748b;
+            font-size: 0.8rem;
+            min-width: 130px;
+            text-align: right;
+            margin-right: 8px;
         }
         .empty {
             text-align: center;
@@ -225,10 +289,16 @@
         </div>
     </div>
     <div class="breadcrumb" id="breadcrumb">Loading...</div>
+    <div class="toolbar">
+        <span class="toolbar-label">Sort:</span>
+        <button class="sort-btn" data-sort="name">Name</button>
+        <button class="sort-btn" data-sort="date">Date</button>
+        <button class="sort-btn" data-sort="size">Size</button>
+    </div>
     <div class="file-list list-view" id="fileList">
         <div class="empty">⏳ Loading...</div>
     </div>
-    <footer>Click images to preview · use ⬇️ / "download" to save</footer>
+    <footer>Click a tile to open · folders navigate, images preview · ⬇ download to save</footer>
 </div>
 
 <div class="lightbox" id="lightbox" role="dialog" aria-modal="true" aria-label="Image preview">
@@ -242,6 +312,67 @@
 <script>
     let currentPath = decodeURIComponent(window.location.hash.substring(1) || '');
     let currentView = localStorage.getItem('galleryView') === 'gallery' ? 'gallery' : 'list';
+    // Sort state. Stored as "field:direction" e.g. "name:asc" or "date:desc".
+    let currentSort = localStorage.getItem('gallerySort') || 'name:asc';
+
+    function getSort() {
+        const [field, dir] = currentSort.split(':');
+        return { field: field || 'name', dir: dir === 'desc' ? 'desc' : 'asc' };
+    }
+
+    function setSort(field) {
+        const cur = getSort();
+        // Click the active field to toggle direction; otherwise switch field
+        // and use a sensible default direction (newest first for date,
+        // largest first for size, A→Z for name).
+        let dir;
+        if (cur.field === field) {
+            dir = cur.dir === 'asc' ? 'desc' : 'asc';
+        } else {
+            dir = field === 'name' ? 'asc' : 'desc';
+        }
+        currentSort = `${field}:${dir}`;
+        localStorage.setItem('gallerySort', currentSort);
+        updateSortButtons();
+        if (window.lastContents) renderFileList(window.lastContents, window.lastCurrentDir);
+    }
+
+    function updateSortButtons() {
+        const { field, dir } = getSort();
+        document.querySelectorAll('.sort-btn').forEach(btn => {
+            const f = btn.getAttribute('data-sort');
+            const active = f === field;
+            btn.classList.toggle('active', active);
+            // Strip any trailing arrow then add the current one if active.
+            const base = btn.textContent.replace(/\s*[▲▼]\s*$/, '');
+            btn.textContent = active ? `${base} ${dir === 'asc' ? '▲' : '▼'}` : base;
+        });
+    }
+
+    function sortContents(items) {
+        const { field, dir } = getSort();
+        const mult = dir === 'asc' ? 1 : -1;
+        const cmp = (a, b) => {
+            // Folders always come before files regardless of sort.
+            if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
+            let av, bv;
+            if (field === 'date') {
+                av = a.modTimeUnix || 0; bv = b.modTimeUnix || 0;
+                if (av === bv) return a.name.localeCompare(b.name);
+                return (av - bv) * mult;
+            }
+            if (field === 'size') {
+                // Folders all share size 0 — fall back to name.
+                if (a.type === 'dir') return a.name.localeCompare(b.name);
+                av = a.sizeBytes || 0; bv = b.sizeBytes || 0;
+                if (av === bv) return a.name.localeCompare(b.name);
+                return (av - bv) * mult;
+            }
+            // name (default)
+            return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }) * mult;
+        };
+        return [...items].sort(cmp);
+    }
 
     function setView(view) {
         currentView = view;
@@ -279,8 +410,12 @@
             return;
         }
 
-        // Build a flat list of images in display order so the lightbox can navigate.
-        const images = contents
+        // Apply current sort (client-side, no extra fetch).
+        const sorted = sortContents(contents);
+
+        // Build a flat list of images in the *displayed* order so the lightbox
+        // navigates the same way the user sees them.
+        const images = sorted
             .filter(it => it.type === 'file' && it.isImage)
             .map(it => ({
                 name: it.name,
@@ -289,26 +424,24 @@
                 downloadUrl: `/api/download?file=${encodeURIComponent(it.path)}&download=1`,
             }));
         window.galleryImages = images;
-
-        // Map a path back to its position in the images array.
         const imgIndex = new Map(images.map((img, i) => [img.path, i]));
 
         let html = '';
         if (currentDir !== '') {
             const parentPath = currentDir.substring(0, currentDir.lastIndexOf('/'));
             if (currentView === 'list') {
-                html += `<div class="item"><div class="item-icon">📁</div><div class="item-name"><a href="#" class="folder-link" data-path="${escapeAttr(parentPath)}">..</a></div><div class="item-size">—</div></div>`;
+                html += `<div class="item"><div class="item-icon">📁</div><div class="item-name"><a href="#" class="folder-link" data-path="${escapeAttr(parentPath)}">..</a></div><div class="item-date"></div><div class="item-size">—</div></div>`;
             } else {
-                html += `<div class="item"><div class="item-icon">📁</div><div class="item-name"><a href="#" class="folder-link" data-path="${escapeAttr(parentPath)}">..</a></div></div>`;
+                html += `<div class="item"><a href="#" class="tile-link folder-link" data-path="${escapeAttr(parentPath)}"><div class="folder-icon">📁</div><div class="item-name">..</div></a></div>`;
             }
         }
 
-        for (const item of contents) {
+        for (const item of sorted) {
             if (item.type === 'dir') {
                 if (currentView === 'list') {
-                    html += `<div class="item"><div class="item-icon">📁</div><div class="item-name"><a href="#" class="folder-link" data-path="${escapeAttr(item.path)}">${escapeHtml(item.name)}</a></div><div class="item-size">—</div></div>`;
+                    html += `<div class="item"><div class="item-icon">📁</div><div class="item-name"><a href="#" class="folder-link" data-path="${escapeAttr(item.path)}">${escapeHtml(item.name)}</a></div><div class="item-date">${escapeHtml(item.modTime || '')}</div><div class="item-size">—</div></div>`;
                 } else {
-                    html += `<div class="item"><div class="item-icon">📁</div><div class="item-name"><a href="#" class="folder-link" data-path="${escapeAttr(item.path)}">${escapeHtml(item.name)}</a></div></div>`;
+                    html += `<div class="item"><a href="#" class="tile-link folder-link" data-path="${escapeAttr(item.path)}"><div class="folder-icon">📁</div><div class="item-name">${escapeHtml(item.name)}</div><div class="item-meta"><span>${escapeHtml(item.modTime || '')}</span></div></a></div>`;
                 }
             } else {
                 const viewUrl = `/api/download?file=${encodeURIComponent(item.path)}`;
@@ -316,16 +449,31 @@
                 const idx = imgIndex.get(item.path);
                 if (currentView === 'list') {
                     if (item.isImage) {
-                        html += `<div class="item"><div class="item-icon">🖼️</div><div class="item-name"><a href="${viewUrl}" class="image-link" data-image-index="${idx}">${escapeHtml(item.name)}</a> ${item.size ? `<small>(${item.size})</small>` : ''} <a href="${downloadUrl}" download title="Download">⬇️</a></div><div class="item-size"></div></div>`;
+                        html += `<div class="item"><div class="item-icon">🖼️</div><div class="item-name"><a href="${viewUrl}" class="image-link" data-image-index="${idx}">${escapeHtml(item.name)}</a> <a href="${downloadUrl}" download title="Download">⬇️</a></div><div class="item-date">${escapeHtml(item.modTime || '')}</div><div class="item-size">${escapeHtml(item.size || '')}</div></div>`;
                     } else {
-                        html += `<div class="item"><div class="item-icon">📄</div><div class="item-name"><a href="${downloadUrl}" download>${escapeHtml(item.name)}</a> ${item.size ? `<small>(${item.size})</small>` : ''}</div><div class="item-size"></div></div>`;
+                        html += `<div class="item"><div class="item-icon">📄</div><div class="item-name"><a href="${downloadUrl}" download>${escapeHtml(item.name)}</a></div><div class="item-date">${escapeHtml(item.modTime || '')}</div><div class="item-size">${escapeHtml(item.size || '')}</div></div>`;
                     }
                 } else {
                     if (item.isImage) {
                         const thumbUrl = `/api/thumbnail?file=${encodeURIComponent(item.path)}`;
-                        html += `<div class="item"><a href="${viewUrl}" class="image-link" data-image-index="${idx}"><img class="thumbnail" src="${thumbUrl}" loading="lazy" alt="${escapeHtml(item.name)}"></a><div class="item-name"><a href="${viewUrl}" class="image-link" data-image-index="${idx}">${escapeHtml(item.name)}</a></div><div class="item-size">${item.size || ''} · <a href="${downloadUrl}" download>download</a></div></div>`;
+                        // The whole tile is one clickable link. Download is a separate
+                        // small link below; clicks on it must NOT also trigger the tile.
+                        html += `<div class="item">
+                            <a href="${viewUrl}" class="tile-link image-link" data-image-index="${idx}">
+                                <img class="thumbnail" src="${thumbUrl}" loading="lazy" alt="${escapeHtml(item.name)}">
+                                <div class="item-name">${escapeHtml(item.name)}</div>
+                                <div class="item-meta"><span>${escapeHtml(item.modTime || '')}</span><span>${escapeHtml(item.size || '')}</span></div>
+                            </a>
+                            <div class="item-meta" style="padding: 0 12px 10px;"><a class="download-link" href="${downloadUrl}" download onclick="event.stopPropagation()">⬇ download</a></div>
+                        </div>`;
                     } else {
-                        html += `<div class="item"><div class="item-icon">📄</div><div class="item-name"><a href="${downloadUrl}" download>${escapeHtml(item.name)}</a></div><div class="item-size">${item.size || ''}</div></div>`;
+                        html += `<div class="item">
+                            <a href="${downloadUrl}" class="tile-link" download>
+                                <div class="folder-icon">📄</div>
+                                <div class="item-name">${escapeHtml(item.name)}</div>
+                                <div class="item-meta"><span>${escapeHtml(item.modTime || '')}</span><span>${escapeHtml(item.size || '')}</span></div>
+                            </a>
+                        </div>`;
                     }
                 }
             }
@@ -459,11 +607,16 @@
     document.getElementById('listViewBtn').addEventListener('click', () => setView('list'));
     document.getElementById('galleryViewBtn').addEventListener('click', () => setView('gallery'));
 
+    document.querySelectorAll('.sort-btn').forEach(btn => {
+        btn.addEventListener('click', () => setSort(btn.getAttribute('data-sort')));
+    });
+
     window.addEventListener('hashchange', () => {
         const newPath = decodeURIComponent(window.location.hash.substring(1) || '');
         if (newPath !== currentPath) fetchDirectory(newPath);
     });
 
+    updateSortButtons();
     setView(currentView);
     fetchDirectory(currentPath);
 </script>
