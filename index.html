@@ -222,12 +222,52 @@
             user-select: none;
         }
         .lightbox.open { display: flex; }
-        .lightbox-img {
-            max-width: 92vw;
-            max-height: 88vh;
-            object-fit: contain;
-            box-shadow: 0 12px 48px rgba(0,0,0,0.6);
+        /* Stage: a black box that holds the image while it loads. The image is
+           hidden until the full bytes arrive, so the user always sees a clean
+           black frame instead of the previous picture or a torn partial render. */
+        .lb-stage {
+            position: relative;
+            width: 92vw;
+            height: 88vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #000;
             border-radius: 4px;
+            box-shadow: 0 12px 48px rgba(0,0,0,0.6);
+            overflow: hidden;
+        }
+        .lightbox-img {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            opacity: 0;
+            transition: opacity 0.15s ease-out;
+        }
+        .lightbox-img.loaded { opacity: 1; }
+        .lb-progress {
+            position: absolute;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            height: 3px;
+            background: rgba(255,255,255,0.08);
+            opacity: 0;
+            transition: opacity 0.2s;
+        }
+        .lb-progress.active { opacity: 1; }
+        .lb-progress-bar {
+            height: 100%;
+            width: 0%;
+            background: #3b82f6;
+            transition: width 0.1s linear;
+        }
+        .lb-error {
+            position: absolute;
+            color: #fca5a5;
+            font-size: 0.95rem;
+            text-align: center;
+            padding: 16px;
         }
         .lightbox-caption {
             position: absolute;
@@ -277,6 +317,145 @@
             .lightbox-prev { left: 8px; }
             .lightbox-next { right: 8px; }
         }
+        /* Comment badge on tiles */
+        .comment-badge {
+            display: inline-block;
+            background: #3b82f6;
+            color: white;
+            font-size: 0.7rem;
+            font-weight: 600;
+            padding: 2px 8px;
+            border-radius: 999px;
+            margin-left: 6px;
+            vertical-align: middle;
+        }
+        .gallery-view .badge-overlay {
+            position: absolute;
+            top: 18px;
+            right: 18px;
+            background: rgba(0,0,0,0.7);
+            color: white;
+            font-size: 0.75rem;
+            padding: 3px 8px;
+            border-radius: 999px;
+            pointer-events: none;
+        }
+        .gallery-view .item { position: relative; }
+        /* Comments panel inside lightbox */
+        .comments-panel {
+            position: absolute;
+            top: 0;
+            right: 0;
+            width: min(380px, 90vw);
+            height: 100%;
+            background: #1e293b;
+            color: #e2e8f0;
+            display: flex;
+            flex-direction: column;
+            transform: translateX(100%);
+            transition: transform 0.25s ease;
+            z-index: 10;
+        }
+        .comments-panel.open { transform: translateX(0); }
+        .comments-panel-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid #334155;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-weight: 600;
+        }
+        .comments-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px 20px;
+        }
+        .comments-list .empty-comments {
+            color: #94a3b8;
+            text-align: center;
+            padding: 24px 0;
+            font-size: 0.9rem;
+        }
+        .comment {
+            background: #334155;
+            border-radius: 10px;
+            padding: 10px 12px;
+            margin-bottom: 10px;
+        }
+        .comment-meta {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.75rem;
+            color: #cbd5e1;
+            margin-bottom: 4px;
+        }
+        .comment-meta .author { font-weight: 600; color: #93c5fd; }
+        .comment-body {
+            font-size: 0.9rem;
+            line-height: 1.4;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .comment-delete {
+            background: none;
+            border: none;
+            color: #fca5a5;
+            cursor: pointer;
+            font-size: 0.75rem;
+            padding: 0;
+            margin-top: 4px;
+        }
+        .comment-delete:hover { text-decoration: underline; }
+        .comment-form {
+            padding: 12px 20px 16px;
+            border-top: 1px solid #334155;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .comment-form textarea {
+            background: #0f172a;
+            color: #e2e8f0;
+            border: 1px solid #475569;
+            border-radius: 8px;
+            padding: 8px 10px;
+            font-size: 0.9rem;
+            font-family: inherit;
+            resize: vertical;
+            min-height: 60px;
+            max-height: 160px;
+        }
+        .comment-form textarea:focus { outline: none; border-color: #3b82f6; }
+        .comment-form button {
+            background: #3b82f6;
+            color: white;
+            border: none;
+            padding: 8px 14px;
+            border-radius: 8px;
+            font-weight: 500;
+            cursor: pointer;
+            align-self: flex-end;
+        }
+        .comment-form button:hover { background: #2563eb; }
+        .comment-form button:disabled { opacity: 0.5; cursor: not-allowed; }
+        .lightbox-comments-toggle {
+            position: absolute;
+            top: 20px;
+            right: 80px;
+        }
+        .lightbox-comments-toggle .badge {
+            position: absolute;
+            top: -4px;
+            right: -4px;
+            background: #ef4444;
+            color: white;
+            font-size: 0.65rem;
+            font-weight: 700;
+            padding: 1px 6px;
+            border-radius: 999px;
+            min-width: 16px;
+            text-align: center;
+        }
     </style>
 </head>
 <body>
@@ -298,15 +477,32 @@
     <div class="file-list list-view" id="fileList">
         <div class="empty">⏳ Loading...</div>
     </div>
-    <footer>Click a tile to open · folders navigate, images preview · ⬇ download to save</footer>
+    <footer>Click a tile to open · 💬 to comment · ⬇ to download · use ←/→ keys in lightbox, C to toggle comments</footer>
 </div>
 
 <div class="lightbox" id="lightbox" role="dialog" aria-modal="true" aria-label="Image preview">
     <button class="lightbox-btn lightbox-close" id="lbClose" aria-label="Close (Esc)">✕</button>
     <button class="lightbox-btn lightbox-prev" id="lbPrev" aria-label="Previous (←)">‹</button>
     <button class="lightbox-btn lightbox-next" id="lbNext" aria-label="Next (→)">›</button>
-    <img class="lightbox-img" id="lbImg" alt="">
+    <button class="lightbox-btn lightbox-comments-toggle" id="lbCommentsBtn" aria-label="Comments (C)">💬<span class="badge" id="lbCommentsBadge" style="display:none">0</span></button>
+    <div class="lb-stage" id="lbStage">
+        <img class="lightbox-img" id="lbImg" alt="">
+        <div class="lb-progress" id="lbProgress" aria-hidden="true"><div class="lb-progress-bar" id="lbProgressBar"></div></div>
+        <div class="lb-error" id="lbError" style="display:none"></div>
+    </div>
     <div class="lightbox-caption" id="lbCaption"></div>
+
+    <aside class="comments-panel" id="commentsPanel" aria-label="Comments">
+        <div class="comments-panel-header">
+            <span>Comments</span>
+            <button class="lightbox-btn" id="commentsClose" aria-label="Close panel" style="position:static;width:32px;height:32px;font-size:1rem">✕</button>
+        </div>
+        <div class="comments-list" id="commentsList"></div>
+        <div class="comment-form">
+            <textarea id="commentInput" placeholder="Write a comment…" maxlength="4000"></textarea>
+            <button id="commentSubmit">Post</button>
+        </div>
+    </aside>
 </div>
 
 <script>
@@ -391,9 +587,9 @@
             const resp = await fetch(`/api/list?${params}`);
             const data = await resp.json();
             if (data.error) throw new Error(data.error);
-            window.lastContents = data.contents;
+            window.lastContents = data.contents || [];
             window.lastCurrentDir = data.currentDir;
-            renderFileList(data.contents, data.currentDir);
+            renderFileList(data.contents || [], data.currentDir);
             renderBreadcrumb(data.currentDir, data.basePathForDisplay);
             window.location.hash = encodeURIComponent(path);
             currentPath = path;
@@ -404,6 +600,8 @@
 
     function renderFileList(contents, currentDir) {
         const container = document.getElementById('fileList');
+        // Server returns null for some empty folders; coerce to [] so .length works.
+        contents = contents || [];
         if (!contents.length) {
             container.innerHTML = '<div class="empty">📭 This folder is empty</div>';
             window.galleryImages = [];
@@ -420,7 +618,10 @@
             .map(it => ({
                 name: it.name,
                 path: it.path,
-                viewUrl: `/api/download?file=${encodeURIComponent(it.path)}`,
+                // /api/preview transparently transcodes HEIC to JPEG for
+                // browsers that don't support it natively, and streams other
+                // image formats unchanged. Always use it for the lightbox.
+                viewUrl: `/api/preview?file=${encodeURIComponent(it.path)}`,
                 downloadUrl: `/api/download?file=${encodeURIComponent(it.path)}&download=1`,
             }));
         window.galleryImages = images;
@@ -436,12 +637,21 @@
             }
         }
 
+        // Returns the HTML for an inline (list-view) badge or empty string when none.
+        const inlineBadge = (item) => item.commentCount > 0
+            ? ` <a href="#" class="comment-badge comment-badge-link" data-path="${escapeAttr(item.path)}" data-name="${escapeAttr(item.name)}" title="View comments">💬 ${item.commentCount}</a>`
+            : '';
+        // Returns the absolute-positioned overlay badge for gallery tiles.
+        const overlayBadge = (item) => item.commentCount > 0
+            ? `<a href="#" class="badge-overlay comment-badge-link" data-path="${escapeAttr(item.path)}" data-name="${escapeAttr(item.name)}" title="View comments" style="pointer-events:auto;text-decoration:none;color:white">💬 ${item.commentCount}</a>`
+            : '';
+
         for (const item of sorted) {
             if (item.type === 'dir') {
                 if (currentView === 'list') {
-                    html += `<div class="item"><div class="item-icon">📁</div><div class="item-name"><a href="#" class="folder-link" data-path="${escapeAttr(item.path)}">${escapeHtml(item.name)}</a></div><div class="item-date">${escapeHtml(item.modTime || '')}</div><div class="item-size">—</div></div>`;
+                    html += `<div class="item"><div class="item-icon">📁</div><div class="item-name"><a href="#" class="folder-link" data-path="${escapeAttr(item.path)}">${escapeHtml(item.name)}</a>${inlineBadge(item)}</div><div class="item-date">${escapeHtml(item.modTime || '')}</div><div class="item-size">—</div></div>`;
                 } else {
-                    html += `<div class="item"><a href="#" class="tile-link folder-link" data-path="${escapeAttr(item.path)}"><div class="folder-icon">📁</div><div class="item-name">${escapeHtml(item.name)}</div><div class="item-meta"><span>${escapeHtml(item.modTime || '')}</span></div></a></div>`;
+                    html += `<div class="item">${overlayBadge(item)}<a href="#" class="tile-link folder-link" data-path="${escapeAttr(item.path)}"><div class="folder-icon">📁</div><div class="item-name">${escapeHtml(item.name)}</div><div class="item-meta"><span>${escapeHtml(item.modTime || '')}</span></div></a></div>`;
                 }
             } else {
                 const viewUrl = `/api/download?file=${encodeURIComponent(item.path)}`;
@@ -449,30 +659,36 @@
                 const idx = imgIndex.get(item.path);
                 if (currentView === 'list') {
                     if (item.isImage) {
-                        html += `<div class="item"><div class="item-icon">🖼️</div><div class="item-name"><a href="${viewUrl}" class="image-link" data-image-index="${idx}">${escapeHtml(item.name)}</a> <a href="${downloadUrl}" download title="Download">⬇️</a></div><div class="item-date">${escapeHtml(item.modTime || '')}</div><div class="item-size">${escapeHtml(item.size || '')}</div></div>`;
+                        html += `<div class="item"><div class="item-icon">🖼️</div><div class="item-name"><a href="${viewUrl}" class="image-link" data-image-index="${idx}">${escapeHtml(item.name)}</a> <a href="${downloadUrl}" download title="Download">⬇️</a>${inlineBadge(item)}</div><div class="item-date">${escapeHtml(item.modTime || '')}</div><div class="item-size">${escapeHtml(item.size || '')}</div></div>`;
                     } else {
-                        html += `<div class="item"><div class="item-icon">📄</div><div class="item-name"><a href="${downloadUrl}" download>${escapeHtml(item.name)}</a></div><div class="item-date">${escapeHtml(item.modTime || '')}</div><div class="item-size">${escapeHtml(item.size || '')}</div></div>`;
+                        html += `<div class="item"><div class="item-icon">📄</div><div class="item-name"><a href="${downloadUrl}" download>${escapeHtml(item.name)}</a>${inlineBadge(item)}</div><div class="item-date">${escapeHtml(item.modTime || '')}</div><div class="item-size">${escapeHtml(item.size || '')}</div></div>`;
                     }
                 } else {
                     if (item.isImage) {
                         const thumbUrl = `/api/thumbnail?file=${encodeURIComponent(item.path)}`;
-                        // The whole tile is one clickable link. Download is a separate
-                        // small link below; clicks on it must NOT also trigger the tile.
                         html += `<div class="item">
+                            ${overlayBadge(item)}
                             <a href="${viewUrl}" class="tile-link image-link" data-image-index="${idx}">
                                 <img class="thumbnail" src="${thumbUrl}" loading="lazy" alt="${escapeHtml(item.name)}">
                                 <div class="item-name">${escapeHtml(item.name)}</div>
                                 <div class="item-meta"><span>${escapeHtml(item.modTime || '')}</span><span>${escapeHtml(item.size || '')}</span></div>
                             </a>
-                            <div class="item-meta" style="padding: 0 12px 10px;"><a class="download-link" href="${downloadUrl}" download onclick="event.stopPropagation()">⬇ download</a></div>
+                            <div class="item-meta" style="padding: 0 12px 10px;">
+                                <a class="download-link" href="${downloadUrl}" download onclick="event.stopPropagation()">⬇ download</a>
+                                <a class="download-link comment-badge-link" href="#" data-path="${escapeAttr(item.path)}" data-name="${escapeAttr(item.name)}">💬 comment</a>
+                            </div>
                         </div>`;
                     } else {
                         html += `<div class="item">
+                            ${overlayBadge(item)}
                             <a href="${downloadUrl}" class="tile-link" download>
                                 <div class="folder-icon">📄</div>
                                 <div class="item-name">${escapeHtml(item.name)}</div>
                                 <div class="item-meta"><span>${escapeHtml(item.modTime || '')}</span><span>${escapeHtml(item.size || '')}</span></div>
                             </a>
+                            <div class="item-meta" style="padding: 0 12px 10px;">
+                                <a class="download-link comment-badge-link" href="#" data-path="${escapeAttr(item.path)}" data-name="${escapeAttr(item.name)}">💬 comment</a>
+                            </div>
                         </div>`;
                     }
                 }
@@ -492,6 +708,18 @@
                 e.preventDefault();
                 const i = parseInt(link.getAttribute('data-image-index'), 10);
                 if (!isNaN(i)) openLightbox(i);
+            });
+        });
+
+        // Comment badges open the comments dialog standalone (not the lightbox).
+        document.querySelectorAll('.comment-badge-link').forEach(link => {
+            link.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                openCommentsStandalone(
+                    link.getAttribute('data-path'),
+                    link.getAttribute('data-name'),
+                );
             });
         });
     }
@@ -542,7 +770,17 @@
         prev: document.getElementById('lbPrev'),
         next: document.getElementById('lbNext'),
         close: document.getElementById('lbClose'),
+        progress: document.getElementById('lbProgress'),
+        progressBar: document.getElementById('lbProgressBar'),
+        errorEl: document.getElementById('lbError'),
         index: 0,
+        // Monotonic counter; bumped on every navigation. The in-flight loader
+        // checks this to know if its result is still wanted.
+        loadGen: 0,
+        // AbortController for the current load; set by loadCurrentImage.
+        loadAbort: null,
+        // Current blob URL — revoked when replaced so memory doesn't leak.
+        currentObjectURL: null,
     };
 
     function openLightbox(i) {
@@ -555,20 +793,120 @@
     }
 
     function closeLightbox() {
+        if (comments) comments.closePanel();
+        cancelImageLoad();
         lb.el.classList.remove('open');
-        lb.img.src = '';
+        clearImage();
         document.body.style.overflow = '';
+    }
+
+    function cancelImageLoad() {
+        if (lb.loadAbort) {
+            lb.loadAbort.abort();
+            lb.loadAbort = null;
+        }
+    }
+
+    function clearImage() {
+        // Drop the previous picture so the user sees a clean black frame the
+        // instant they press prev/next — no flicker of the old image.
+        lb.img.classList.remove('loaded');
+        lb.img.removeAttribute('src');
+        if (lb.currentObjectURL) {
+            URL.revokeObjectURL(lb.currentObjectURL);
+            lb.currentObjectURL = null;
+        }
+        lb.errorEl.style.display = 'none';
+    }
+
+    function setProgress(frac) {
+        lb.progressBar.style.width = Math.max(0, Math.min(1, frac)) * 100 + '%';
+    }
+
+    async function loadCurrentImage(item) {
+        cancelImageLoad();
+        clearImage();
+
+        const myGen = ++lb.loadGen;
+        const ctrl = new AbortController();
+        lb.loadAbort = ctrl;
+
+        // Show the progress strip; reset to 0.
+        setProgress(0);
+        lb.progress.classList.add('active');
+        // Indeterminate-ish: if the server doesn't send Content-Length we still
+        // want the strip to show motion. Animate to ~25% as a baseline.
+        let haveLength = false;
+
+        try {
+            const resp = await fetch(item.viewUrl, { signal: ctrl.signal, credentials: 'same-origin' });
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+            const total = parseInt(resp.headers.get('Content-Length') || '0', 10);
+            haveLength = total > 0;
+
+            // Stream the response so we can update the progress bar in real time.
+            const reader = resp.body.getReader();
+            const chunks = [];
+            let received = 0;
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                chunks.push(value);
+                received += value.length;
+                if (myGen !== lb.loadGen) return; // user navigated away mid-load
+                if (haveLength) {
+                    setProgress(received / total);
+                } else {
+                    // No Content-Length: creep toward 90% so the bar still moves.
+                    setProgress(Math.min(0.9, received / (received + 200000)));
+                }
+            }
+            if (myGen !== lb.loadGen) return;
+
+            const blob = new Blob(chunks, { type: resp.headers.get('Content-Type') || 'image/jpeg' });
+            const url = URL.createObjectURL(blob);
+            lb.currentObjectURL = url;
+            // Wait for decode before revealing — avoids the brief 1-frame flash.
+            lb.img.onload = () => {
+                if (myGen !== lb.loadGen) return;
+                lb.img.classList.add('loaded');
+                setProgress(1);
+                // Hide the strip after a beat so users see it complete.
+                setTimeout(() => {
+                    if (myGen === lb.loadGen) lb.progress.classList.remove('active');
+                }, 200);
+            };
+            lb.img.onerror = () => {
+                if (myGen !== lb.loadGen) return;
+                showImageError('Failed to render image');
+            };
+            lb.img.src = url;
+        } catch (err) {
+            if (err.name === 'AbortError' || myGen !== lb.loadGen) return;
+            showImageError(err.message || 'Failed to load image');
+        }
+    }
+
+    function showImageError(msg) {
+        lb.progress.classList.remove('active');
+        lb.errorEl.textContent = '⚠️ ' + msg;
+        lb.errorEl.style.display = 'block';
     }
 
     function showLightboxImage() {
         const imgs = window.galleryImages || [];
         const item = imgs[lb.index];
         if (!item) return;
-        lb.img.src = item.viewUrl;
         lb.img.alt = item.name;
         lb.caption.innerHTML = `${escapeHtml(item.name)} <span style="opacity:0.7">(${lb.index + 1}/${imgs.length})</span> <a href="${item.downloadUrl}" download>download</a>`;
         lb.prev.disabled = lb.index === 0;
         lb.next.disabled = lb.index === imgs.length - 1;
+        // Kick off a streamed load. Bytes paint as they arrive; until decode
+        // completes the user sees a black frame, never the previous image.
+        loadCurrentImage(item);
+        // Bind the comments panel to this image. It only fetches when actually visible.
+        comments.bindTo(item.path, item.name);
     }
 
     function lbStep(delta) {
@@ -588,9 +926,12 @@
     });
     document.addEventListener('keydown', (e) => {
         if (!lb.el.classList.contains('open')) return;
+        // If the user is typing in the comment box, ignore navigation/close keys.
+        if (document.activeElement && document.activeElement.tagName === 'TEXTAREA') return;
         if (e.key === 'Escape') closeLightbox();
         else if (e.key === 'ArrowLeft') lbStep(-1);
         else if (e.key === 'ArrowRight') lbStep(1);
+        else if (e.key === 'c' || e.key === 'C') comments.togglePanel();
     });
     // Touch swipe support.
     let touchStartX = null;
@@ -603,6 +944,192 @@
         if (Math.abs(dx) > 50) lbStep(dx < 0 ? 1 : -1);
         touchStartX = null;
     });
+
+    /* ---------- Comments ---------- */
+    let comments;
+    comments = (() => {
+        const panel = document.getElementById('commentsPanel');
+        const list = document.getElementById('commentsList');
+        const input = document.getElementById('commentInput');
+        const submit = document.getElementById('commentSubmit');
+        const closeBtn = document.getElementById('commentsClose');
+        const toggleBtn = document.getElementById('lbCommentsBtn');
+        const badge = document.getElementById('lbCommentsBadge');
+        // Track what we're currently commenting on. May be null when nothing's open.
+        let current = { path: null, name: null };
+        // Standalone mode = lightbox-less; we open the panel as a centered modal.
+        let standalone = false;
+
+        function setBadge(n) {
+            if (n > 0) {
+                badge.textContent = n;
+                badge.style.display = 'inline-block';
+            } else {
+                badge.style.display = 'none';
+            }
+        }
+
+        async function load() {
+            if (!current.path) return;
+            list.innerHTML = '<div class="empty-comments">Loading…</div>';
+            try {
+                const resp = await fetch(`/api/comments?file=${encodeURIComponent(current.path)}`);
+                const data = await resp.json();
+                if (data.error) throw new Error(data.error);
+                render(data.comments || []);
+                setBadge((data.comments || []).length);
+            } catch (err) {
+                list.innerHTML = `<div class="empty-comments">⚠️ ${escapeHtml(err.message)}</div>`;
+            }
+        }
+
+        function render(items) {
+            if (!items.length) {
+                list.innerHTML = '<div class="empty-comments">No comments yet. Be the first.</div>';
+                return;
+            }
+            list.innerHTML = items.map(c => `
+                <div class="comment" data-id="${c.id}">
+                    <div class="comment-meta">
+                        <span class="author">${escapeHtml(c.author)}</span>
+                        <span>${formatTime(c.createdAt)}</span>
+                    </div>
+                    <div class="comment-body">${escapeHtml(c.body)}</div>
+                    ${c.mine ? `<button class="comment-delete" data-id="${c.id}">Delete</button>` : ''}
+                </div>
+            `).join('');
+            list.querySelectorAll('.comment-delete').forEach(btn => {
+                btn.addEventListener('click', () => del(btn.getAttribute('data-id')));
+            });
+            // Auto-scroll to bottom so newest comment is visible.
+            list.scrollTop = list.scrollHeight;
+        }
+
+        async function post() {
+            const body = input.value.trim();
+            if (!body || !current.path) return;
+            submit.disabled = true;
+            try {
+                const resp = await fetch('/api/comments', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ file: current.path, body }),
+                });
+                const data = await resp.json();
+                if (data.error) throw new Error(data.error);
+                input.value = '';
+                await load();
+                bumpListingBadge(current.path, +1);
+            } catch (err) {
+                alert('Failed to post comment: ' + err.message);
+            } finally {
+                submit.disabled = false;
+            }
+        }
+
+        async function del(id) {
+            if (!confirm('Delete this comment?')) return;
+            try {
+                const resp = await fetch(`/api/comments?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+                const data = await resp.json();
+                if (data.error) throw new Error(data.error);
+                await load();
+                bumpListingBadge(current.path, -1);
+            } catch (err) {
+                alert('Failed to delete: ' + err.message);
+            }
+        }
+
+        // Keep the in-page tile badges in sync without refetching the listing.
+        function bumpListingBadge(path, delta) {
+            if (!window.lastContents) return;
+            const item = window.lastContents.find(it => it.path === path);
+            if (!item) return;
+            item.commentCount = Math.max(0, (item.commentCount || 0) + delta);
+            renderFileList(window.lastContents, window.lastCurrentDir);
+        }
+
+        function bindTo(path, name) {
+            current = { path, name };
+            // Reset; load() runs whenever the panel is open or the user opens it.
+            list.innerHTML = '<div class="empty-comments">…</div>';
+            input.value = '';
+            // If the panel is already open inside the lightbox, refresh now.
+            if (panel.classList.contains('open')) load();
+            else load(); // also fetch so the badge count is correct even when closed
+        }
+
+        function openPanel() {
+            panel.classList.add('open');
+            // load() may already have run via bindTo, but call again to ensure
+            // the list is fresh when re-opening on the same image.
+            if (current.path) load();
+        }
+
+        function closePanel() {
+            panel.classList.remove('open');
+            if (standalone) {
+                // Take down the lightbox shell we borrowed for the standalone case.
+                lb.el.classList.remove('open');
+                document.body.style.overflow = '';
+                // Restore lightbox's normal image-mode UI.
+                lb.img.style.display = '';
+                lb.prev.style.display = '';
+                lb.next.style.display = '';
+                toggleBtn.style.display = '';
+                lb.caption.style.display = '';
+                standalone = false;
+            }
+        }
+
+        function togglePanel() {
+            if (panel.classList.contains('open')) closePanel();
+            else openPanel();
+        }
+
+        // Open the comments panel without any image — used by the comment badges
+        // on tiles (folders, non-image files, or images without opening lightbox).
+        function openStandalone(path, name) {
+            standalone = true;
+            // Reuse the lightbox shell so we get the dark backdrop & escape-to-close.
+            lb.el.classList.add('open');
+            document.body.style.overflow = 'hidden';
+            // Hide the image-mode bits.
+            lb.img.style.display = 'none';
+            lb.prev.style.display = 'none';
+            lb.next.style.display = 'none';
+            toggleBtn.style.display = 'none';
+            lb.caption.style.display = 'none';
+            bindTo(path, name);
+            openPanel();
+        }
+
+        toggleBtn.addEventListener('click', togglePanel);
+        closeBtn.addEventListener('click', closePanel);
+        submit.addEventListener('click', post);
+        // Cmd/Ctrl+Enter posts the comment.
+        input.addEventListener('keydown', (e) => {
+            if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                e.preventDefault();
+                post();
+            }
+        });
+
+        return { bindTo, openPanel, closePanel, togglePanel, openStandalone };
+    })();
+
+    function openCommentsStandalone(path, name) {
+        comments.openStandalone(path, name);
+    }
+
+    function formatTime(unix) {
+        if (!unix) return '';
+        const d = new Date(unix * 1000);
+        const now = new Date();
+        const sameDay = d.toDateString() === now.toDateString();
+        if (sameDay) return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        return d.toLocaleString([], { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    }
 
     document.getElementById('listViewBtn').addEventListener('click', () => setView('list'));
     document.getElementById('galleryViewBtn').addEventListener('click', () => setView('gallery'));
