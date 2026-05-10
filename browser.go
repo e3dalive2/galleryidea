@@ -10,7 +10,10 @@ import (
 	"flag"
 	"fmt"
 	"image"
+	_ "image/gif"  // register GIF decoder with image.Decode
 	"image/jpeg"
+	_ "image/png"  // register PNG decoder with image.Decode
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,7 +22,7 @@ import (
 
 	_ "modernc.org/sqlite" // pure-Go driver, no CGo required
 
-	_ "github.com/gen2brain/heic" // pure-Go HEIC decoder, registers with image.Decode
+	"github.com/gen2brain/heic" // pure-Go HEIC decoder
 
 	"golang.org/x/image/draw"
 )
@@ -393,9 +396,9 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	img, _, err := image.Decode(file)
+	img, err := decodeImage(file, fullPath)
 	if err != nil {
-		http.Error(w, "Unsupported image format", http.StatusBadRequest)
+		http.Error(w, "Unsupported image format: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -407,6 +410,17 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "image/jpeg")
 	jpeg.Encode(w, dst, &jpeg.Options{Quality: 85})
+}
+
+// decodeImage decodes an image file, dispatching to gen2brain/heic for HEIC/HEIF
+// files (their magic-byte detection is incomplete — many iPhone files have
+// ftypmif1 rather than ftypheic — so we route by extension instead).
+func decodeImage(r io.Reader, path string) (image.Image, error) {
+	if isHeicFile(path) {
+		return heic.Decode(r)
+	}
+	img, _, err := image.Decode(r)
+	return img, err
 }
 
 // handlePreview returns an image suitable for inline browser display. For
@@ -440,7 +454,7 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	img, _, err := image.Decode(file)
+	img, err := decodeImage(file, fullPath)
 	if err != nil {
 		http.Error(w, "Unsupported image format: "+err.Error(), http.StatusUnsupportedMediaType)
 		return

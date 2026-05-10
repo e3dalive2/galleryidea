@@ -254,13 +254,18 @@
             background: rgba(255,255,255,0.08);
             opacity: 0;
             transition: opacity 0.2s;
+            overflow: hidden;
         }
         .lb-progress.active { opacity: 1; }
         .lb-progress-bar {
             height: 100%;
-            width: 0%;
+            width: 35%;
             background: #3b82f6;
-            transition: width 0.1s linear;
+            position: relative;
+        }
+        @keyframes lb-progress-indeterminate {
+            0%   { transform: translateX(-120%); }
+            100% { transform: translateX(330%); }
         }
         .lb-error {
             position: absolute;
@@ -774,13 +779,8 @@
         progressBar: document.getElementById('lbProgressBar'),
         errorEl: document.getElementById('lbError'),
         index: 0,
-        // Monotonic counter; bumped on every navigation. The in-flight loader
-        // checks this to know if its result is still wanted.
+        // Bumped every navigation so stale onload callbacks can be ignored.
         loadGen: 0,
-        // AbortController for the current load; set by loadCurrentImage.
-        loadAbort: null,
-        // Current blob URL — revoked when replaced so memory doesn't leak.
-        currentObjectURL: null,
     };
 
     function openLightbox(i) {
@@ -794,102 +794,51 @@
 
     function closeLightbox() {
         if (comments) comments.closePanel();
-        cancelImageLoad();
         lb.el.classList.remove('open');
         clearImage();
         document.body.style.overflow = '';
     }
 
-    function cancelImageLoad() {
-        if (lb.loadAbort) {
-            lb.loadAbort.abort();
-            lb.loadAbort = null;
-        }
-    }
-
     function clearImage() {
-        // Drop the previous picture so the user sees a clean black frame the
-        // instant they press prev/next — no flicker of the old image.
+        // Hide the previous image so the user sees only the black stage while
+        // the next one downloads. removeAttribute('src') is what actually drops
+        // the rendered pixels — setting src='' would fire a load event for an
+        // empty URL in some browsers.
         lb.img.classList.remove('loaded');
         lb.img.removeAttribute('src');
-        if (lb.currentObjectURL) {
-            URL.revokeObjectURL(lb.currentObjectURL);
-            lb.currentObjectURL = null;
-        }
         lb.errorEl.style.display = 'none';
+        lb.progress.classList.remove('active');
     }
 
-    function setProgress(frac) {
-        lb.progressBar.style.width = Math.max(0, Math.min(1, frac)) * 100 + '%';
-    }
-
-    async function loadCurrentImage(item) {
-        cancelImageLoad();
+    function loadCurrentImage(item) {
+        const myGen = ++lb.loadGen;
         clearImage();
 
-        const myGen = ++lb.loadGen;
-        const ctrl = new AbortController();
-        lb.loadAbort = ctrl;
-
-        // Show the progress strip; reset to 0.
-        setProgress(0);
+        // Show an indeterminate progress bar while the browser fetches & decodes.
+        // The browser already paints JPEGs progressively as bytes arrive, so once
+        // the <img> becomes visible (on `load`) we're done.
         lb.progress.classList.add('active');
-        // Indeterminate-ish: if the server doesn't send Content-Length we still
-        // want the strip to show motion. Animate to ~25% as a baseline.
-        let haveLength = false;
+        lb.progressBar.style.animation = 'lb-progress-indeterminate 1.4s linear infinite';
 
-        try {
-            const resp = await fetch(item.viewUrl, { signal: ctrl.signal, credentials: 'same-origin' });
-            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-
-            const total = parseInt(resp.headers.get('Content-Length') || '0', 10);
-            haveLength = total > 0;
-
-            // Stream the response so we can update the progress bar in real time.
-            const reader = resp.body.getReader();
-            const chunks = [];
-            let received = 0;
-            while (true) {
-                const { value, done } = await reader.read();
-                if (done) break;
-                chunks.push(value);
-                received += value.length;
-                if (myGen !== lb.loadGen) return; // user navigated away mid-load
-                if (haveLength) {
-                    setProgress(received / total);
-                } else {
-                    // No Content-Length: creep toward 90% so the bar still moves.
-                    setProgress(Math.min(0.9, received / (received + 200000)));
-                }
-            }
+        const onLoad = () => {
+            if (myGen !== lb.loadGen) return; // user navigated away
+            lb.img.classList.add('loaded');
+            lb.progress.classList.remove('active');
+            lb.progressBar.style.animation = '';
+        };
+        const onError = () => {
             if (myGen !== lb.loadGen) return;
+            showImageError('Failed to load image');
+        };
 
-            const blob = new Blob(chunks, { type: resp.headers.get('Content-Type') || 'image/jpeg' });
-            const url = URL.createObjectURL(blob);
-            lb.currentObjectURL = url;
-            // Wait for decode before revealing — avoids the brief 1-frame flash.
-            lb.img.onload = () => {
-                if (myGen !== lb.loadGen) return;
-                lb.img.classList.add('loaded');
-                setProgress(1);
-                // Hide the strip after a beat so users see it complete.
-                setTimeout(() => {
-                    if (myGen === lb.loadGen) lb.progress.classList.remove('active');
-                }, 200);
-            };
-            lb.img.onerror = () => {
-                if (myGen !== lb.loadGen) return;
-                showImageError('Failed to render image');
-            };
-            lb.img.src = url;
-        } catch (err) {
-            if (err.name === 'AbortError' || myGen !== lb.loadGen) return;
-            showImageError(err.message || 'Failed to load image');
-        }
+        lb.img.onload = onLoad;
+        lb.img.onerror = onError;
+        lb.img.src = item.viewUrl;
     }
 
     function showImageError(msg) {
         lb.progress.classList.remove('active');
+        lb.progressBar.style.animation = '';
         lb.errorEl.textContent = '⚠️ ' + msg;
         lb.errorEl.style.display = 'block';
     }
