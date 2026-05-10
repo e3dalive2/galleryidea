@@ -242,19 +242,6 @@
             max-height: 100%;
             object-fit: contain;
         }
-        /* The "curtain" is a black panel anchored to the TOP of the stage that
-           covers the image. Its height shrinks toward 0 as bytes arrive, so
-           the image is revealed top-to-bottom — the 90s progressive-load look. */
-        .lb-curtain {
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: 100%;
-            background: #000;
-            transition: height 0.15s linear;
-            pointer-events: none;
-        }
         .lb-progress {
             position: absolute;
             left: 0;
@@ -502,7 +489,6 @@
     <button class="lightbox-btn lightbox-comments-toggle" id="lbCommentsBtn" aria-label="Comments (C)">💬<span class="badge" id="lbCommentsBadge" style="display:none">0</span></button>
     <div class="lb-stage" id="lbStage">
         <img class="lightbox-img" id="lbImg" alt="">
-        <div class="lb-curtain" id="lbCurtain" aria-hidden="true"></div>
         <div class="lb-progress" id="lbProgress" aria-hidden="true"><div class="lb-progress-bar" id="lbProgressBar"></div></div>
         <div class="lb-error" id="lbError" style="display:none"></div>
     </div>
@@ -788,14 +774,10 @@
         close: document.getElementById('lbClose'),
         progress: document.getElementById('lbProgress'),
         progressBar: document.getElementById('lbProgressBar'),
-        curtain: document.getElementById('lbCurtain'),
         errorEl: document.getElementById('lbError'),
         index: 0,
-        // Bumped every navigation so stale onload callbacks can be ignored.
         loadGen: 0,
-        // AbortController for the current streaming fetch.
         loadAbort: null,
-        // Blob URL of the fully-loaded current image, revoked on next clear.
         currentObjectURL: null,
     };
 
@@ -816,110 +798,65 @@
     }
 
     function clearImage() {
+        // Replace previous image with a 1x1 transparent pixel — the browser
+        // drops its rendered pixels immediately. Without this some browsers
+        // keep showing the old image until first byte of new arrives.
         if (lb.currentObjectURL) {
             URL.revokeObjectURL(lb.currentObjectURL);
             lb.currentObjectURL = null;
         }
         lb.img.src = 'data:image/gif;base64,R0lGODlhAQABAAAAACw=';
-        // Cover the entire image with black; the overlay shrinks downward as
-        // bytes arrive, simulating a top-to-bottom progressive paint.
-        lb.curtain.style.height = '100%';
-        lb.curtain.style.display = 'block';
         lb.errorEl.style.display = 'none';
         lb.progress.classList.remove('active');
     }
 
-    // loadCurrentImage streams the image with fetch() and tracks download
-    // progress. The image element is set to the full image as soon as the
-    // bytes are in memory — but a black "curtain" overlay covers it,
-    // shrinking from full height to zero in lockstep with received-bytes /
-    // total-bytes. The visual result is the 90s top-to-bottom reveal,
-    // independent of browser progressive-decoding quirks.
-    async function loadCurrentImage(item) {
+    // loadCurrentImage relies on the browser's native progressive rendering.
+    // Our server encodes baseline JPEGs with no buffering (no Content-Length
+    // pre-buffering, no compression), so as bytes arrive at the <img> the
+    // browser paints scanlines top-to-bottom in real time. The progress bar
+    // tracks total download progress as a redundant indicator.
+    function loadCurrentImage(item) {
         const myGen = ++lb.loadGen;
         clearImage();
 
         if (lb.loadAbort) {
             try { lb.loadAbort.abort(); } catch (_) {}
+            lb.loadAbort = null;
         }
-        const ctrl = new AbortController();
-        lb.loadAbort = ctrl;
 
         lb.progress.classList.add('active');
         lb.progressBar.style.animation = 'lb-progress-indeterminate 1.4s linear infinite';
 
-        const setCurtain = (frac) => {
-            // frac 0..1: 0 = fully covered, 1 = fully revealed.
-            const remaining = Math.max(0, Math.min(1, 1 - frac));
-            lb.curtain.style.height = (remaining * 100).toFixed(1) + '%';
-        };
-
-        try {
-            const resp = await fetch(item.viewUrl, { signal: ctrl.signal, credentials: 'same-origin' });
+        const onLoad = () => {
             if (myGen !== lb.loadGen) return;
-            if (!resp.ok) {
-                const text = (await resp.text()).trim();
-                throw new Error(`${resp.status} ${resp.statusText}${text ? ' — ' + text.split('\n')[0].slice(0, 200) : ''}`);
-            }
-            const mime = resp.headers.get('Content-Type') || 'image/jpeg';
-            const total = parseInt(resp.headers.get('Content-Length') || '0', 10);
-
-            if (!resp.body || !resp.body.getReader) {
-                // Old browser: fall back to one-shot.
-                const blob = await resp.blob();
-                if (myGen !== lb.loadGen) return;
-                showFinalImage(blob, myGen);
-                return;
-            }
-
-            const reader = resp.body.getReader();
-            const chunks = [];
-            let received = 0;
-            // If we don't know total size, animate the curtain on a fake
-            // asymptote so it still moves smoothly toward the bottom.
-            const haveTotal = total > 0;
-            while (true) {
-                const { value, done } = await reader.read();
-                if (done) break;
-                if (myGen !== lb.loadGen) return;
-                chunks.push(value);
-                received += value.length;
-                const frac = haveTotal
-                    ? Math.min(0.97, received / total)  // cap below 1 until fully done
-                    : Math.min(0.92, received / (received + 200_000));
-                setCurtain(frac);
-            }
-            if (myGen !== lb.loadGen) return;
-
-            const blob = new Blob(chunks, { type: mime });
-            showFinalImage(blob, myGen);
-        } catch (err) {
-            if (err.name === 'AbortError' || myGen !== lb.loadGen) return;
-            showImageError(err.message || 'Failed to load image');
-        }
-    }
-
-    function showFinalImage(blob, myGen) {
-        const url = URL.createObjectURL(blob);
-        if (lb.currentObjectURL) URL.revokeObjectURL(lb.currentObjectURL);
-        lb.currentObjectURL = url;
-        lb.img.onload = () => {
-            if (myGen !== lb.loadGen) return;
-            // Drop the curtain to zero now that the full image is decoded.
-            lb.curtain.style.height = '0%';
-            // Hide curtain entirely after the transition finishes so it
-            // doesn't capture clicks.
-            setTimeout(() => {
-                if (myGen === lb.loadGen) lb.curtain.style.display = 'none';
-            }, 250);
             lb.progress.classList.remove('active');
             lb.progressBar.style.animation = '';
         };
-        lb.img.onerror = () => {
+        const onError = async () => {
             if (myGen !== lb.loadGen) return;
-            showImageError('Image decode failed');
+            const ctrl = new AbortController();
+            lb.loadAbort = ctrl;
+            let msg = 'Failed to load image';
+            try {
+                const resp = await fetch(item.viewUrl, { signal: ctrl.signal, credentials: 'same-origin' });
+                if (myGen !== lb.loadGen) return;
+                if (!resp.ok) {
+                    const text = (await resp.text()).trim();
+                    msg = `${resp.status} ${resp.statusText}${text ? ' — ' + text.split('\n')[0].slice(0, 200) : ''}`;
+                }
+            } catch (_) { /* network really down */ }
+            if (myGen !== lb.loadGen) return;
+            showImageError(msg);
         };
-        lb.img.src = url;
+
+        lb.img.onload = onLoad;
+        lb.img.onerror = onError;
+        // requestAnimationFrame ensures the transparent-pixel reset paints
+        // first, so the user always sees the black stage between images.
+        requestAnimationFrame(() => {
+            if (myGen !== lb.loadGen) return;
+            lb.img.src = item.viewUrl;
+        });
     }
 
     function showImageError(msg) {

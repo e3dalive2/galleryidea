@@ -35,6 +35,7 @@ var frontend embed.FS
 
 var baseDir string
 var db *sql.DB
+var heicFlipY bool // toggled by -heic-flip flag; flips heif-convert output on the Y axis
 var (
 	thumbCacheDir   string // 300px JPEG thumbnails
 	previewCacheDir string // 1080p JPEG previews
@@ -105,7 +106,10 @@ func main() {
 	passFlag := flag.String("pass", "", "Password for HTTP basic auth (also reads $GALLERY_PASS).")
 	dbFlag := flag.String("db", "comments.db", "Path to SQLite database file for comments")
 	cacheFlag := flag.String("cache-dir", "", "Directory for image caches (thumbnails + 1080p previews). Default: <dir of -db>/cache")
+	flipFlag := flag.Bool("heic-flip", true, "Flip HEIC images on the Y axis after heif-convert (workaround for libheif orientation bugs producing upside-down images). Default true; set to false if your HEICs come out correctly oriented.")
 	flag.Parse()
+
+	heicFlipY = *flipFlag
 
 	if *decodeHeicFlag != "" {
 		decodeHeicSubprocess(*decodeHeicFlag)
@@ -491,9 +495,17 @@ func serveResizedImage(w http.ResponseWriter, r *http.Request, cacheDir string, 
 	if cachePath != "" {
 		if f, err := os.Open(cachePath); err == nil {
 			defer f.Close()
+			st, _ := f.Stat()
 			w.Header().Set("Content-Type", "image/jpeg")
 			w.Header().Set("Cache-Control", "private, max-age=3600")
-			io.Copy(w, f)
+			if st != nil {
+				w.Header().Set("Content-Length", fmt.Sprintf("%d", st.Size()))
+			}
+			// Stream in small chunks with explicit Flush so the browser
+			// receives bytes as they leave disk. Default io.Copy uses 32KB
+			// buffers and Go's http server buffers further before flushing,
+			// which delays the user's progressive paint.
+			streamWithFlush(w, f, 16*1024)
 			if warmPreview {
 				warmPreviewIfMissing(fullPath, stat)
 			}
@@ -642,15 +654,43 @@ func resizeMaxWidth(src image.Image, max int) image.Image {
 	return dst
 }
 
+// streamWithFlush copies src to dst in small chunks, flushing dst after each
+// chunk if it implements http.Flusher. Used so the client browser receives
+// JPEG bytes as fast as they leave disk, enabling progressive top-to-bottom
+// paint of baseline JPEGs.
+func streamWithFlush(dst io.Writer, src io.Reader, chunkSize int) {
+	flusher, _ := dst.(http.Flusher)
+	buf := make([]byte, chunkSize)
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
 // cachedPathFor returns the disk cache path for a (file, target-width) pair.
 // Empty string means caching is disabled. The width is part of the key so
 // thumbnail and preview caches never collide even though they share the
-// directory tree's parent.
+// directory tree's parent. For HEIC files the heic-flip setting is also
+// part of the key so toggling -heic-flip invalidates only HEIC cache entries.
 func cachedPathFor(cacheDir, fullPath string, info os.FileInfo, width int) string {
 	if cacheDir == "" {
 		return ""
 	}
-	h := sha256.Sum256([]byte(fmt.Sprintf("%s|%d|%d|%d", fullPath, info.ModTime().UnixNano(), info.Size(), width)))
+	keyExtras := ""
+	if isHeicFile(fullPath) {
+		keyExtras = fmt.Sprintf("|flipY=%v", heicFlipY)
+	}
+	h := sha256.Sum256([]byte(fmt.Sprintf("%s|%d|%d|%d%s", fullPath, info.ModTime().UnixNano(), info.Size(), width, keyExtras)))
 	return filepath.Join(cacheDir, fmt.Sprintf("%x.jpg", h[:16]))
 }
 
@@ -712,12 +752,10 @@ func decodeHeicViaSelf(fullPath string) ([]byte, error) {
 // an error if the binary isn't installed; the caller can detect this and
 // surface a useful message.
 //
-// libheif 1.17.x's heif-convert ignores or misapplies the HEIC `irot`/`imir`
-// transforms in many real-world iPhone files, producing output that is
-// vertically mirrored. We unconditionally flip the result on the Y axis here.
-// This is wrong for files where libheif gets the orientation right (rare in
-// practice with the affected libheif versions); accepting that trade-off
-// because the user's actual library has the wrong orientation otherwise.
+// Some libheif versions misapply HEIC `irot`/`imir` transforms and produce
+// vertically-flipped output for certain iPhone HEICs. The -heic-flip flag
+// flips the result on the Y axis to compensate; users whose HEICs come out
+// upside down should toggle this on.
 func decodeHeicViaHeifConvert(fullPath string) ([]byte, error) {
 	bin, err := exec.LookPath("heif-convert")
 	if err != nil {
@@ -733,8 +771,6 @@ func decodeHeicViaHeifConvert(fullPath string) ([]byte, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	// -q 90 sets JPEG quality. heif-convert infers output format from the
-	// destination's extension.
 	cmd := exec.CommandContext(ctx, bin, "-q", "90", fullPath, tmpPath)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -750,12 +786,14 @@ func decodeHeicViaHeifConvert(fullPath string) ([]byte, error) {
 		return nil, err
 	}
 
-	// Flip on Y axis to undo libheif's mirrored output.
+	if !heicFlipY {
+		return rawJPEG, nil
+	}
+
+	// User asked for a Y-axis flip to compensate for libheif orientation bugs.
 	src, err := decodeImage(bytes.NewReader(rawJPEG))
 	if err != nil {
-		// If we can't even decode our own output, return the raw bytes —
-		// at least the caller can show something rather than a hard error.
-		return rawJPEG, nil
+		return rawJPEG, nil // can't decode our own output? give up gracefully
 	}
 	flipped := flipVertical(src)
 	var buf bytes.Buffer
