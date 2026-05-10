@@ -860,7 +860,7 @@
         const item = imgs[lb.index];
         if (!item) return;
         lb.img.alt = item.name;
-        lb.caption.innerHTML = `${escapeHtml(item.name)} <span style="opacity:0.7">(${lb.index + 1}/${imgs.length})</span> <a href="${item.downloadUrl}" download>download</a>`;
+        lb.caption.innerHTML = `${escapeHtml(item.name)} <span style="opacity:0.7">(${lb.index + 1}/${imgs.length})</span> <a href="${item.downloadUrl}" download title="Download full-size original">⬇ original</a>`;
         lb.prev.disabled = lb.index === 0;
         lb.next.disabled = lb.index === imgs.length - 1;
         // Kick off a streamed load. Bytes paint as they arrive; until decode
