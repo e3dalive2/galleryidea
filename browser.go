@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -16,6 +17,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -81,12 +83,22 @@ type ListResponse struct {
 }
 
 func main() {
+	// Subprocess HEIC decoder mode. The parent server spawns us with this flag
+	// to isolate HEIC decoding from the main process — a SIGSEGV in WASM/HEIC
+	// then takes down only the child, not the gallery.
+	decodeHeicFlag := flag.String("decode-heic", "", "(internal) decode given HEIC file to JPEG on stdout; used by the parent process")
+
 	dirFlag := flag.String("dir", ".", "Root directory to browse")
 	portFlag := flag.String("port", "8080", "Port to listen on")
 	userFlag := flag.String("user", "", "Username for HTTP basic auth (also reads $GALLERY_USER). Leave empty to disable auth.")
 	passFlag := flag.String("pass", "", "Password for HTTP basic auth (also reads $GALLERY_PASS).")
 	dbFlag := flag.String("db", "comments.db", "Path to SQLite database file for comments")
 	flag.Parse()
+
+	if *decodeHeicFlag != "" {
+		decodeHeicSubprocess(*decodeHeicFlag)
+		return // unreachable in practice; subprocess always exits inside the call
+	}
 
 	abs, err := filepath.Abs(*dirFlag)
 	if err != nil {
@@ -399,17 +411,34 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	file, err := os.Open(fullPath)
-	if err != nil {
-		http.Error(w, "Cannot open image", http.StatusInternalServerError)
-		return
-	}
-	defer file.Close()
-
-	img, err := decodeImage(file, fullPath)
-	if err != nil {
-		http.Error(w, "Unsupported image format: "+err.Error(), http.StatusBadRequest)
-		return
+	var img image.Image
+	if isHeicFile(fullPath) {
+		// Decode out-of-process to JPEG bytes, then decode the JPEG so we can
+		// resize. Crashes in the HEIC subprocess don't affect this server.
+		jpegBytes, err := decodeHeicToJPEG(fullPath)
+		if err != nil {
+			http.Error(w, "Unsupported image: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		decoded, err := decodeImage(bytes.NewReader(jpegBytes))
+		if err != nil {
+			http.Error(w, "Bad HEIC subprocess output: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		img = decoded
+	} else {
+		file, err := os.Open(fullPath)
+		if err != nil {
+			http.Error(w, "Cannot open image", http.StatusInternalServerError)
+			return
+		}
+		defer file.Close()
+		decoded, err := decodeImage(file)
+		if err != nil {
+			http.Error(w, "Unsupported image format: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		img = decoded
 	}
 
 	srcBounds := img.Bounds()
@@ -427,27 +456,80 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 // Bounded concurrency keeps memory predictable and prevents OOM kills.
 var heicSem = make(chan struct{}, 2)
 
-// decodeImage decodes an image file, dispatching to gen2brain/heic for HEIC/HEIF
-// files (their magic-byte detection is incomplete — many iPhone files have
-// ftypmif1 rather than ftypheic — so we route by extension instead).
-//
-// HEIC decoding goes through a WASM runtime that can panic on malformed or
-// unsupported variants. We recover so a bad file returns a clean error
-// instead of taking the whole server down.
-func decodeImage(r io.Reader, path string) (img image.Image, err error) {
-	defer func() {
-		if rec := recover(); rec != nil {
-			err = fmt.Errorf("decoder panic: %v", rec)
-			img = nil
-		}
-	}()
-	if isHeicFile(path) {
-		heicSem <- struct{}{}
-		defer func() { <-heicSem }()
-		return heic.Decode(r)
+// decodeHeicToJPEG runs a child process to decode the HEIC file at fullPath
+// and returns the resulting JPEG bytes. Running in a subprocess isolates
+// SIGSEGVs and unrecoverable runtime crashes from the WASM-based HEIC decoder
+// — the child dies, the parent server stays up.
+func decodeHeicToJPEG(fullPath string) ([]byte, error) {
+	heicSem <- struct{}{}
+	defer func() { <-heicSem }()
+
+	self, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("os.Executable: %w", err)
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, self, "-decode-heic", fullPath)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		// stderr may carry a useful "unsupported feature X" message from libheif.
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return nil, fmt.Errorf("HEIC decode failed: %s", msg)
+	}
+	if stdout.Len() == 0 {
+		return nil, fmt.Errorf("HEIC decoder produced no output")
+	}
+	return stdout.Bytes(), nil
+}
+
+// decodeImage decodes a non-HEIC image. HEIC callers should use
+// decodeHeicToJPEG and feed the resulting JPEG bytes back into image.Decode
+// only when they need an image.Image (e.g. to resize for a thumbnail).
+func decodeImage(r io.Reader) (image.Image, error) {
 	im, _, err := image.Decode(r)
 	return im, err
+}
+
+// decodeHeicSubprocess is the entry point for the child process spawned with
+// `-decode-heic <file>`. It writes JPEG bytes to stdout and exits. A panic
+// here only kills the child; the parent server reads exit status and stderr.
+func decodeHeicSubprocess(path string) {
+	if !isHeicFile(path) {
+		fmt.Fprintf(os.Stderr, "decode-heic called on non-HEIC path: %s\n", path)
+		os.Exit(2)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "open: %v\n", err)
+		os.Exit(1)
+	}
+	defer f.Close()
+
+	// Recover from Go panics here too — they may produce useful messages.
+	// SIGSEGVs from inside WASM still kill us, which is the whole point.
+	defer func() {
+		if rec := recover(); rec != nil {
+			fmt.Fprintf(os.Stderr, "decoder panic: %v\n", rec)
+			os.Exit(1)
+		}
+	}()
+
+	img, err := heic.Decode(f)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "heic.Decode: %v\n", err)
+		os.Exit(1)
+	}
+	if err := jpeg.Encode(os.Stdout, img, &jpeg.Options{Quality: 90}); err != nil {
+		fmt.Fprintf(os.Stderr, "jpeg.Encode: %v\n", err)
+		os.Exit(1)
+	}
+	os.Exit(0)
 }
 
 // Recovered HTTP middleware: any panic inside the handler chain becomes a
@@ -489,8 +571,9 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// HEIC: decode and re-encode as JPEG. Result is cached on disk so repeat
-	// views (and especially navigation through a folder of HEICs) is fast.
+	// HEIC: decode out-of-process to JPEG, cache on disk, serve. Running the
+	// decoder in a subprocess means a SIGSEGV in the WASM HEIC decoder kills
+	// only the child — this server stays up.
 	stat, err := os.Stat(fullPath)
 	if err != nil {
 		http.Error(w, "Cannot stat image", http.StatusInternalServerError)
@@ -507,43 +590,31 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	file, err := os.Open(fullPath)
+	jpegBytes, err := decodeHeicToJPEG(fullPath)
 	if err != nil {
-		http.Error(w, "Cannot open image", http.StatusInternalServerError)
+		http.Error(w, "Unsupported image: "+err.Error(), http.StatusUnsupportedMediaType)
 		return
 	}
-	defer file.Close()
 
-	img, err := decodeImage(file, fullPath)
-	if err != nil {
-		http.Error(w, "Unsupported image format: "+err.Error(), http.StatusUnsupportedMediaType)
-		return
+	// Persist to cache atomically (write temp + rename) so concurrent readers
+	// never see a partial file.
+	if cachePath != "" {
+		if tmp, err := os.CreateTemp(heicCacheDir, ".tmp-*"); err == nil {
+			if _, werr := tmp.Write(jpegBytes); werr != nil {
+				tmp.Close()
+				os.Remove(tmp.Name())
+			} else {
+				tmp.Close()
+				if err := os.Rename(tmp.Name(), cachePath); err != nil {
+					os.Remove(tmp.Name())
+				}
+			}
+		}
 	}
 
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Header().Set("Cache-Control", "private, max-age=3600")
-	// Encode to a buffer-like writer that fans out to both the response and
-	// the cache file. If the cache write fails we still serve the response.
-	if cachePath != "" {
-		if tmp, err := os.CreateTemp(heicCacheDir, ".tmp-*"); err == nil {
-			mw := io.MultiWriter(w, tmp)
-			if encErr := jpeg.Encode(mw, img, &jpeg.Options{Quality: 90}); encErr != nil {
-				fmt.Fprintf(os.Stderr, "preview encode failed for %s: %v\n", fullPath, encErr)
-				tmp.Close()
-				os.Remove(tmp.Name())
-				return
-			}
-			tmp.Close()
-			// Atomic publish: rename only after the encode finished cleanly.
-			if err := os.Rename(tmp.Name(), cachePath); err != nil {
-				os.Remove(tmp.Name())
-			}
-			return
-		}
-	}
-	if err := jpeg.Encode(w, img, &jpeg.Options{Quality: 90}); err != nil {
-		fmt.Fprintf(os.Stderr, "preview encode failed for %s: %v\n", fullPath, err)
-	}
+	w.Write(jpegBytes)
 }
 
 // heicCachePathFor returns the cache path for a HEIC file. The key includes
