@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"flag"
@@ -19,6 +21,16 @@ import (
 var frontend embed.FS
 
 var baseDir string
+
+// Pre-hashed expected credentials. Hashing both the expected and the supplied
+// values lets us compare with constant-time equality on equal-length inputs,
+// which avoids timing leaks regardless of the actual password length.
+var (
+	authEnabled  bool
+	expectedUser [32]byte
+	expectedPass [32]byte
+	authRealm    = "Gallery Browser"
+)
 
 type FileInfo struct {
 	Name        string `json:"name"`
@@ -41,6 +53,8 @@ type ListResponse struct {
 func main() {
 	dirFlag := flag.String("dir", ".", "Root directory to browse")
 	portFlag := flag.String("port", "8080", "Port to listen on")
+	userFlag := flag.String("user", "", "Username for HTTP basic auth (also reads $GALLERY_USER). Leave empty to disable auth.")
+	passFlag := flag.String("pass", "", "Password for HTTP basic auth (also reads $GALLERY_PASS).")
 	flag.Parse()
 
 	abs, err := filepath.Abs(*dirFlag)
@@ -55,15 +69,75 @@ func main() {
 		os.Exit(1)
 	}
 
-	http.HandleFunc("/", serveFrontend)
-	http.HandleFunc("/api/list", handleList)
-	http.HandleFunc("/api/download", handleDownload)
-	http.HandleFunc("/api/thumbnail", handleThumbnail)
+	// Resolve credentials: flags win, env vars are the fallback so passwords
+	// don't have to appear in shell history or `ps` output.
+	user := *userFlag
+	pass := *passFlag
+	if user == "" {
+		user = os.Getenv("GALLERY_USER")
+	}
+	if pass == "" {
+		pass = os.Getenv("GALLERY_PASS")
+	}
+	if user != "" || pass != "" {
+		if user == "" || pass == "" {
+			fmt.Fprintln(os.Stderr, "Error: -user and -pass must both be set (or neither).")
+			os.Exit(1)
+		}
+		authEnabled = true
+		expectedUser = sha256.Sum256([]byte(user))
+		expectedPass = sha256.Sum256([]byte(pass))
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", serveFrontend)
+	mux.HandleFunc("/api/list", handleList)
+	mux.HandleFunc("/api/download", handleDownload)
+	mux.HandleFunc("/api/thumbnail", handleThumbnail)
 
 	addr := ":" + *portFlag
 	fmt.Printf("🌐 Serving: %s\n", baseDir)
+	if authEnabled {
+		fmt.Printf("🔒 Auth enabled for user %q\n", user)
+	} else {
+		fmt.Println("⚠️  Auth disabled (set -user and -pass to enable).")
+	}
 	fmt.Printf("🚀 Gallery at http://localhost%s\n", addr)
-	http.ListenAndServe(addr, nil)
+	if err := http.ListenAndServe(addr, withAuth(mux)); err != nil {
+		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// withAuth wraps the given handler with HTTP Basic Auth when credentials are
+// configured. It is a no-op pass-through otherwise.
+func withAuth(next http.Handler) http.Handler {
+	if !authEnabled {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		if !ok {
+			requireAuth(w)
+			return
+		}
+		gotUser := sha256.Sum256([]byte(user))
+		gotPass := sha256.Sum256([]byte(pass))
+		// subtle.ConstantTimeCompare returns 1 only when the byte slices are
+		// equal AND the same length — true here because they're SHA-256 hashes.
+		userOK := subtle.ConstantTimeCompare(gotUser[:], expectedUser[:]) == 1
+		passOK := subtle.ConstantTimeCompare(gotPass[:], expectedPass[:]) == 1
+		if !(userOK && passOK) {
+			requireAuth(w)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func requireAuth(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Basic realm=%q, charset="UTF-8"`, authRealm))
+	http.Error(w, "Unauthorized", http.StatusUnauthorized)
 }
 
 func serveFrontend(w http.ResponseWriter, r *http.Request) {
