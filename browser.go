@@ -711,6 +711,13 @@ func decodeHeicViaSelf(fullPath string) ([]byte, error) {
 // decodeHeicViaHeifConvert shells out to the `heif-convert` binary. Returns
 // an error if the binary isn't installed; the caller can detect this and
 // surface a useful message.
+//
+// libheif 1.17.x's heif-convert ignores or misapplies the HEIC `irot`/`imir`
+// transforms in many real-world iPhone files, producing output that is
+// vertically mirrored. We unconditionally flip the result on the Y axis here.
+// This is wrong for files where libheif gets the orientation right (rare in
+// practice with the affected libheif versions); accepting that trade-off
+// because the user's actual library has the wrong orientation otherwise.
 func decodeHeicViaHeifConvert(fullPath string) ([]byte, error) {
 	bin, err := exec.LookPath("heif-convert")
 	if err != nil {
@@ -738,7 +745,38 @@ func decodeHeicViaHeifConvert(fullPath string) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("heif-convert: %s", msg)
 	}
-	return os.ReadFile(tmpPath)
+	rawJPEG, err := os.ReadFile(tmpPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Flip on Y axis to undo libheif's mirrored output.
+	src, err := decodeImage(bytes.NewReader(rawJPEG))
+	if err != nil {
+		// If we can't even decode our own output, return the raw bytes —
+		// at least the caller can show something rather than a hard error.
+		return rawJPEG, nil
+	}
+	flipped := flipVertical(src)
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, flipped, &jpeg.Options{Quality: 90}); err != nil {
+		return rawJPEG, nil
+	}
+	return buf.Bytes(), nil
+}
+
+// flipVertical returns a new image that is src mirrored on the Y axis: the
+// first row of src becomes the last row of the result and so on.
+func flipVertical(src image.Image) image.Image {
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	dst := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			dst.Set(x, h-1-y, src.At(b.Min.X+x, b.Min.Y+y))
+		}
+	}
+	return dst
 }
 
 // decodeImage decodes a non-HEIC image. HEIC callers should use
