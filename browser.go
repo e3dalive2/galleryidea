@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go driver, no CGo required
@@ -186,6 +187,11 @@ func main() {
 		fmt.Printf("🔒 Auth enabled for user %q\n", user)
 	} else {
 		fmt.Println("⚠️  Auth disabled (set -user and -pass to enable).")
+	}
+	if _, err := exec.LookPath("heif-convert"); err == nil {
+		fmt.Println("🖼️  heif-convert detected; will be used as HEIC fallback")
+	} else {
+		fmt.Println("🖼️  heif-convert not found (apt install libheif-examples to handle more HEIC variants)")
 	}
 	fmt.Printf("🚀 Gallery at http://localhost%s\n", addr)
 	if err := http.ListenAndServe(addr, withRecover(withAuth(mux))); err != nil {
@@ -427,7 +433,11 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleThumbnail(w http.ResponseWriter, r *http.Request) {
-	serveResizedImage(w, r, thumbCacheDir, thumbWidth, thumbQuality)
+	// warmPreview=true so that the same decode that produces the thumbnail
+	// also writes the 1080p preview to disk in the background. By the time
+	// the user clicks the thumbnail, the lightbox can serve from cache and
+	// pop up instantly.
+	serveResizedImage(w, r, thumbCacheDir, thumbWidth, thumbQuality, true)
 }
 
 // handlePreview serves a 1080p-class JPEG. Originals (often 12+ MB iPhone
@@ -435,19 +445,33 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 // resize and cache them too. The download button uses /api/download for the
 // original.
 func handlePreview(w http.ResponseWriter, r *http.Request) {
-	serveResizedImage(w, r, previewCacheDir, previewWidth, previewJPEGQ)
+	serveResizedImage(w, r, previewCacheDir, previewWidth, previewJPEGQ, false)
 }
+
+// previewWarmSem caps concurrent background preview generations so a fast
+// scroll through a folder doesn't spawn 100 goroutines all decoding HEICs.
+var previewWarmSem = make(chan struct{}, 4)
+
+// inFlight tracks paths currently being warmed so we don't queue duplicate
+// work when the user scrolls back and forth or refreshes.
+var (
+	inFlightMu sync.Mutex
+	inFlight   = map[string]bool{}
+)
 
 // serveResizedImage is the shared cache-aware resizer. It:
 //   1. Validates the path and confirms it's an image.
-//   2. Hashes (path + mtime + size) for the cache key.
+//   2. Hashes (path + mtime + size + width) for the cache key.
 //   3. Streams the cached JPEG straight from disk on hit.
 //   4. On miss: decodes (subprocess for HEIC), resizes if needed, encodes
 //      as JPEG, atomically writes the cache file, then serves it.
+//   5. If warmPreview is true and the preview cache file is missing, kicks
+//      off a background goroutine that resizes the same decoded image to
+//      preview width and writes the preview cache file.
 //
 // The same function powers thumbnails (300px) and previews (1920px) — the
 // only difference is the target width, JPEG quality, and cache directory.
-func serveResizedImage(w http.ResponseWriter, r *http.Request, cacheDir string, targetWidth, quality int) {
+func serveResizedImage(w http.ResponseWriter, r *http.Request, cacheDir string, targetWidth, quality int, warmPreview bool) {
 	fileRel := r.URL.Query().Get("file")
 	fullPath := safeJoin(baseDir, fileRel)
 	if fullPath == "" || isDir(fullPath) || !isImageFile(fullPath) {
@@ -460,7 +484,9 @@ func serveResizedImage(w http.ResponseWriter, r *http.Request, cacheDir string, 
 		return
 	}
 
-	// 1. Cache hit?
+	// 1. Cache hit? Serve immediately. If we still need to warm the preview
+	// (same response only triggers warm when this is a thumbnail handler),
+	// kick that off first; the work is independent of the response.
 	cachePath := cachedPathFor(cacheDir, fullPath, stat, targetWidth)
 	if cachePath != "" {
 		if f, err := os.Open(cachePath); err == nil {
@@ -468,46 +494,24 @@ func serveResizedImage(w http.ResponseWriter, r *http.Request, cacheDir string, 
 			w.Header().Set("Content-Type", "image/jpeg")
 			w.Header().Set("Cache-Control", "private, max-age=3600")
 			io.Copy(w, f)
+			if warmPreview {
+				warmPreviewIfMissing(fullPath, stat)
+			}
 			return
 		}
 	}
 
 	// 2. Decode (HEIC out-of-process; everything else in-process).
-	var src image.Image
-	if isHeicFile(fullPath) {
-		jpegBytes, err := decodeHeicToJPEG(fullPath)
-		if err != nil {
-			http.Error(w, "Unsupported image: "+err.Error(), http.StatusUnsupportedMediaType)
-			return
-		}
-		src, err = decodeImage(bytes.NewReader(jpegBytes))
-		if err != nil {
-			http.Error(w, "Bad HEIC subprocess output: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-	} else {
-		f, err := os.Open(fullPath)
-		if err != nil {
-			http.Error(w, "Cannot open image", http.StatusInternalServerError)
-			return
-		}
-		defer f.Close()
-		src, err = decodeImage(f)
-		if err != nil {
-			http.Error(w, "Unsupported image format: "+err.Error(), http.StatusBadRequest)
-			return
-		}
+	src, decodeErr := decodeAnyImage(fullPath)
+	if decodeErr != nil {
+		http.Error(w, "Unsupported image: "+decodeErr.Error(), http.StatusBadRequest)
+		return
 	}
 
-	// 3. Resize if larger than target. Skip resizing for already-small images
-	// to avoid quality loss from upscaling.
+	// 3. Resize and serve.
 	dst := resizeMaxWidth(src, targetWidth)
-
-	// 4. Encode JPEG once, write to both response and cache file. MultiWriter
-	// is cheaper than encoding twice.
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Header().Set("Cache-Control", "private, max-age=3600")
-
 	if cachePath != "" {
 		if tmp, err := os.CreateTemp(cacheDir, ".tmp-*"); err == nil {
 			mw := io.MultiWriter(w, tmp)
@@ -515,18 +519,108 @@ func serveResizedImage(w http.ResponseWriter, r *http.Request, cacheDir string, 
 				fmt.Fprintf(os.Stderr, "encode failed for %s: %v\n", fullPath, encErr)
 				tmp.Close()
 				os.Remove(tmp.Name())
-				return
+			} else {
+				tmp.Close()
+				if err := os.Rename(tmp.Name(), cachePath); err != nil {
+					os.Remove(tmp.Name())
+				}
 			}
-			tmp.Close()
-			if err := os.Rename(tmp.Name(), cachePath); err != nil {
-				os.Remove(tmp.Name())
-			}
-			return
+		}
+	} else {
+		if err := jpeg.Encode(w, dst, &jpeg.Options{Quality: quality}); err != nil {
+			fmt.Fprintf(os.Stderr, "encode failed for %s: %v\n", fullPath, err)
 		}
 	}
-	if err := jpeg.Encode(w, dst, &jpeg.Options{Quality: quality}); err != nil {
-		fmt.Fprintf(os.Stderr, "encode failed for %s: %v\n", fullPath, err)
+
+	// 4. Warm the preview cache while we still have the decoded image around.
+	// This is a synchronous call but uses the already-decoded `src` so the
+	// expensive part (decode) is shared with the thumbnail. Encoding+writing
+	// 1920px JPEG is cheap and runs after the response is sent.
+	if warmPreview {
+		go writePreviewFromImage(fullPath, stat, src)
 	}
+}
+
+// warmPreviewIfMissing decodes the file and writes the preview cache, but only
+// if the preview file isn't already on disk. Used when the thumbnail was a
+// cache hit so we never decoded — we only do the work if it's actually missing.
+func warmPreviewIfMissing(fullPath string, stat os.FileInfo) {
+	previewPath := cachedPathFor(previewCacheDir, fullPath, stat, previewWidth)
+	if previewPath == "" {
+		return
+	}
+	if _, err := os.Stat(previewPath); err == nil {
+		return // already cached
+	}
+	go func() {
+		// Deduplicate concurrent warmups for the same file.
+		inFlightMu.Lock()
+		if inFlight[fullPath] {
+			inFlightMu.Unlock()
+			return
+		}
+		inFlight[fullPath] = true
+		inFlightMu.Unlock()
+		defer func() {
+			inFlightMu.Lock()
+			delete(inFlight, fullPath)
+			inFlightMu.Unlock()
+		}()
+
+		previewWarmSem <- struct{}{}
+		defer func() { <-previewWarmSem }()
+
+		src, err := decodeAnyImage(fullPath)
+		if err != nil {
+			return // already logged by decoder; thumbnail succeeded so don't double-log
+		}
+		writePreviewFromImage(fullPath, stat, src)
+	}()
+}
+
+// writePreviewFromImage resizes src to preview width and writes the result to
+// the preview cache (atomic temp+rename). Safe to call from any goroutine.
+func writePreviewFromImage(fullPath string, stat os.FileInfo, src image.Image) {
+	previewPath := cachedPathFor(previewCacheDir, fullPath, stat, previewWidth)
+	if previewPath == "" {
+		return
+	}
+	// Skip if another request already wrote it.
+	if _, err := os.Stat(previewPath); err == nil {
+		return
+	}
+	dst := resizeMaxWidth(src, previewWidth)
+	tmp, err := os.CreateTemp(previewCacheDir, ".tmp-*")
+	if err != nil {
+		return
+	}
+	if err := jpeg.Encode(tmp, dst, &jpeg.Options{Quality: previewJPEGQ}); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return
+	}
+	tmp.Close()
+	if err := os.Rename(tmp.Name(), previewPath); err != nil {
+		os.Remove(tmp.Name())
+	}
+}
+
+// decodeAnyImage decodes a file at fullPath into an image.Image, picking the
+// HEIC subprocess path when the extension warrants it.
+func decodeAnyImage(fullPath string) (image.Image, error) {
+	if isHeicFile(fullPath) {
+		jpegBytes, err := decodeHeicToJPEG(fullPath)
+		if err != nil {
+			return nil, err
+		}
+		return decodeImage(bytes.NewReader(jpegBytes))
+	}
+	f, err := os.Open(fullPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return decodeImage(f)
 }
 
 // resizeMaxWidth returns src resized so its longest edge is at most max.
@@ -569,10 +663,28 @@ var heicSem = make(chan struct{}, 2)
 // and returns the resulting JPEG bytes. Running in a subprocess isolates
 // SIGSEGVs and unrecoverable runtime crashes from the WASM-based HEIC decoder
 // — the child dies, the parent server stays up.
+//
+// If the pure-Go decoder fails, we fall back to the `heif-convert` system
+// binary (from libheif-examples). It handles many more HEIC variants —
+// notably most iPhone files that the WASM build chokes on.
 func decodeHeicToJPEG(fullPath string) ([]byte, error) {
 	heicSem <- struct{}{}
 	defer func() { <-heicSem }()
 
+	if data, err := decodeHeicViaSelf(fullPath); err == nil {
+		return data, nil
+	} else if data, err2 := decodeHeicViaHeifConvert(fullPath); err2 == nil {
+		return data, nil
+	} else {
+		// Both decoders failed — surface the more informative of the two.
+		return nil, fmt.Errorf("HEIC decode failed (gen2brain: %v) (heif-convert: %v)", err, err2)
+	}
+}
+
+// decodeHeicViaSelf invokes ourselves as a child process to use the embedded
+// gen2brain/heic decoder. Isolated to its own process so SIGSEGVs don't kill
+// the server.
+func decodeHeicViaSelf(fullPath string) ([]byte, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return nil, fmt.Errorf("os.Executable: %w", err)
@@ -584,17 +696,49 @@ func decodeHeicToJPEG(fullPath string) ([]byte, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		// stderr may carry a useful "unsupported feature X" message from libheif.
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = err.Error()
 		}
-		return nil, fmt.Errorf("HEIC decode failed: %s", msg)
+		return nil, fmt.Errorf("%s", msg)
 	}
 	if stdout.Len() == 0 {
-		return nil, fmt.Errorf("HEIC decoder produced no output")
+		return nil, fmt.Errorf("no output")
 	}
 	return stdout.Bytes(), nil
+}
+
+// decodeHeicViaHeifConvert shells out to the `heif-convert` binary. Returns
+// an error if the binary isn't installed; the caller can detect this and
+// surface a useful message.
+func decodeHeicViaHeifConvert(fullPath string) ([]byte, error) {
+	bin, err := exec.LookPath("heif-convert")
+	if err != nil {
+		return nil, fmt.Errorf("heif-convert not installed (apt install libheif-examples)")
+	}
+	tmp, err := os.CreateTemp("", "heif-out-*.jpg")
+	if err != nil {
+		return nil, err
+	}
+	tmpPath := tmp.Name()
+	tmp.Close()
+	defer os.Remove(tmpPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	// -q 90 sets JPEG quality. heif-convert infers output format from the
+	// destination's extension.
+	cmd := exec.CommandContext(ctx, bin, "-q", "90", fullPath, tmpPath)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return nil, fmt.Errorf("heif-convert: %s", msg)
+	}
+	return os.ReadFile(tmpPath)
 }
 
 // decodeImage decodes a non-HEIC image. HEIC callers should use
