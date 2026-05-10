@@ -32,6 +32,7 @@ var frontend embed.FS
 
 var baseDir string
 var db *sql.DB
+var heicCacheDir string // directory for cached HEIC→JPEG previews; empty = no cache
 
 // Pre-hashed expected credentials. Hashing both the expected and the supplied
 // values lets us compare with constant-time equality on equal-length inputs,
@@ -126,6 +127,15 @@ func main() {
 	}
 	defer db.Close()
 
+	// Stash HEIC preview JPEGs alongside the comments DB. Decoding HEIC is
+	// expensive (hundreds of ms per image); caching makes subsequent views
+	// instant.
+	heicCacheDir = filepath.Join(filepath.Dir(*dbFlag), "heic-cache")
+	if err := os.MkdirAll(heicCacheDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot create cache dir: %v\n", err)
+		heicCacheDir = "" // disable caching, keep going
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", serveFrontend)
 	mux.HandleFunc("/api/list", handleList)
@@ -143,7 +153,7 @@ func main() {
 		fmt.Println("⚠️  Auth disabled (set -user and -pass to enable).")
 	}
 	fmt.Printf("🚀 Gallery at http://localhost%s\n", addr)
-	if err := http.ListenAndServe(addr, withAuth(mux)); err != nil {
+	if err := http.ListenAndServe(addr, withRecover(withAuth(mux))); err != nil {
 		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 		os.Exit(1)
 	}
@@ -412,15 +422,50 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	jpeg.Encode(w, dst, &jpeg.Options{Quality: 85})
 }
 
+// heicSem caps concurrent HEIC decodes. The WASM runtime is memory-hungry —
+// a few iPhone-sized HEICs decoded in parallel can blow past several GB.
+// Bounded concurrency keeps memory predictable and prevents OOM kills.
+var heicSem = make(chan struct{}, 2)
+
 // decodeImage decodes an image file, dispatching to gen2brain/heic for HEIC/HEIF
 // files (their magic-byte detection is incomplete — many iPhone files have
 // ftypmif1 rather than ftypheic — so we route by extension instead).
-func decodeImage(r io.Reader, path string) (image.Image, error) {
+//
+// HEIC decoding goes through a WASM runtime that can panic on malformed or
+// unsupported variants. We recover so a bad file returns a clean error
+// instead of taking the whole server down.
+func decodeImage(r io.Reader, path string) (img image.Image, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			err = fmt.Errorf("decoder panic: %v", rec)
+			img = nil
+		}
+	}()
 	if isHeicFile(path) {
+		heicSem <- struct{}{}
+		defer func() { <-heicSem }()
 		return heic.Decode(r)
 	}
-	img, _, err := image.Decode(r)
-	return img, err
+	im, _, err := image.Decode(r)
+	return im, err
+}
+
+// Recovered HTTP middleware: any panic inside the handler chain becomes a
+// 500 instead of crashing the process. Belt-and-braces: decodeImage already
+// recovers, but third-party code anywhere in the stack might panic too.
+func withRecover(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				fmt.Fprintf(os.Stderr, "panic in %s %s: %v\n", r.Method, r.URL.Path, rec)
+				// Best-effort: only write the header if nothing's been sent yet.
+				// http.ResponseWriter doesn't expose "wrote yet?" so we just try
+				// and swallow any further error.
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 
 // handlePreview returns an image suitable for inline browser display. For
@@ -444,9 +489,24 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// HEIC: decode and re-encode as JPEG. The gen2brain/heic blank import
-	// registers HEIC with image.Decode, so this works the same as any other
-	// format.
+	// HEIC: decode and re-encode as JPEG. Result is cached on disk so repeat
+	// views (and especially navigation through a folder of HEICs) is fast.
+	stat, err := os.Stat(fullPath)
+	if err != nil {
+		http.Error(w, "Cannot stat image", http.StatusInternalServerError)
+		return
+	}
+	cachePath := heicCachePathFor(fullPath, stat)
+	if cachePath != "" {
+		if cached, err := os.Open(cachePath); err == nil {
+			defer cached.Close()
+			w.Header().Set("Content-Type", "image/jpeg")
+			w.Header().Set("Cache-Control", "private, max-age=3600")
+			io.Copy(w, cached)
+			return
+		}
+	}
+
 	file, err := os.Open(fullPath)
 	if err != nil {
 		http.Error(w, "Cannot open image", http.StatusInternalServerError)
@@ -461,13 +521,40 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "image/jpeg")
-	// Cache aggressively — the underlying file's path is stable and re-encoding
-	// is expensive. Browsers will revalidate on Cmd-Shift-R if needed.
 	w.Header().Set("Cache-Control", "private, max-age=3600")
+	// Encode to a buffer-like writer that fans out to both the response and
+	// the cache file. If the cache write fails we still serve the response.
+	if cachePath != "" {
+		if tmp, err := os.CreateTemp(heicCacheDir, ".tmp-*"); err == nil {
+			mw := io.MultiWriter(w, tmp)
+			if encErr := jpeg.Encode(mw, img, &jpeg.Options{Quality: 90}); encErr != nil {
+				fmt.Fprintf(os.Stderr, "preview encode failed for %s: %v\n", fullPath, encErr)
+				tmp.Close()
+				os.Remove(tmp.Name())
+				return
+			}
+			tmp.Close()
+			// Atomic publish: rename only after the encode finished cleanly.
+			if err := os.Rename(tmp.Name(), cachePath); err != nil {
+				os.Remove(tmp.Name())
+			}
+			return
+		}
+	}
 	if err := jpeg.Encode(w, img, &jpeg.Options{Quality: 90}); err != nil {
-		// Already wrote headers; nothing useful to do but log.
 		fmt.Fprintf(os.Stderr, "preview encode failed for %s: %v\n", fullPath, err)
 	}
+}
+
+// heicCachePathFor returns the cache path for a HEIC file. The key includes
+// the file's mtime+size so edits invalidate the cache automatically. Returns
+// "" when caching is disabled.
+func heicCachePathFor(fullPath string, info os.FileInfo) string {
+	if heicCacheDir == "" {
+		return ""
+	}
+	h := sha256.Sum256([]byte(fmt.Sprintf("%s|%d|%d", fullPath, info.ModTime().UnixNano(), info.Size())))
+	return filepath.Join(heicCacheDir, fmt.Sprintf("%x.jpg", h[:16]))
 }
 
 // handleComments routes by HTTP method:

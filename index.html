@@ -826,9 +826,21 @@
             lb.progress.classList.remove('active');
             lb.progressBar.style.animation = '';
         };
-        const onError = () => {
+        const onError = async () => {
             if (myGen !== lb.loadGen) return;
-            showImageError('Failed to load image');
+            // <img> error events don't tell us why. Re-fetch HEAD/GET to grab
+            // the server's actual message (e.g. "Unsupported image format").
+            let msg = 'Failed to load image';
+            try {
+                const resp = await fetch(item.viewUrl, { credentials: 'same-origin' });
+                if (myGen !== lb.loadGen) return;
+                if (!resp.ok) {
+                    const text = (await resp.text()).trim();
+                    msg = `${resp.status} ${resp.statusText}${text ? ' — ' + text.split('\n')[0].slice(0, 200) : ''}`;
+                }
+            } catch (_) { /* network really is down; keep generic message */ }
+            if (myGen !== lb.loadGen) return;
+            showImageError(msg);
         };
 
         lb.img.onload = onLoad;
